@@ -5,6 +5,7 @@ import {
   PROMPT_FALLBACK_SELECTOR,
   SEND_BUTTON_SELECTORS,
   STOP_BUTTON_SELECTOR,
+  STOP_BUTTON_SELECTORS,
   ASSISTANT_ROLE_SELECTOR,
 } from "../constants.js";
 import {
@@ -545,6 +546,107 @@ export function buildAttachmentReadyExpressionForTest(attachmentNames: Attachmen
   return buildAttachmentReadyExpression(attachmentNames);
 }
 
+// A layout change after measurement can move the button before the trusted click.
+const SEND_CLICK_MAX_ATTEMPTS = 4;
+const SEND_CLICK_VERIFY_MS = 2_500;
+
+interface SendEffectState {
+  composerCleared?: boolean;
+  stopVisible?: boolean;
+  turnsCount?: number;
+}
+
+// Renderer-side snapshot of everything a successful send changes. Embedded both
+// in the send-button script (so the pre-click reading costs no extra round trip)
+// and in the post-click probe.
+function buildSendEffectStateExpression(): string {
+  return `(() => {
+    const inputs = ${JSON.stringify(INPUT_SELECTORS)}
+      .map((selector) => document.querySelector(selector))
+      .filter((node) => Boolean(node));
+    const visibleNode = (node) => {
+      if (!node || typeof node.getBoundingClientRect !== 'function') return false;
+      const rect = node.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      const style = window.getComputedStyle(node);
+      return style.display !== 'none' && style.visibility !== 'hidden';
+    };
+    const readValue = (node) => {
+      if (!node) return '';
+      if (node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement) return node.value ?? '';
+      return node.innerText ?? '';
+    };
+    const visible = inputs.filter((node) => visibleNode(node));
+    const active = visible.length > 0 ? visible : inputs;
+    const composerCleared =
+      active.length === 0 ? false : active.every((node) => !String(readValue(node)).trim());
+    const stopVisible = ${JSON.stringify(STOP_BUTTON_SELECTORS)}.some((selector) =>
+      Array.from(document.querySelectorAll(selector)).some((node) => visibleNode(node)),
+    );
+    const turnsCount = ${buildConversationTurnCountExpression()};
+    return { composerCleared, stopVisible, turnsCount };
+  })()`;
+}
+
+type SendClickOutcome = "landed" | "missed" | "unknown";
+
+// "missed" requires positive evidence that no trusted click reached the button:
+// the armed isTrusted marker still reads false AND nothing a send would change
+// has changed. An unreadable marker (navigation, destroyed context) can never
+// prove a miss, so it remains unknown and cannot authorize a retry.
+//
+// Signals are click-relative: the pre-click snapshot keeps a still-running
+// generation's stop control, or a turn count raised by an earlier response,
+// from reading as proof that THIS click worked. The conversation URL is
+// deliberately excluded; resumed conversations are already on /c/.
+async function confirmSendClick(
+  Runtime: ChromeClient["Runtime"],
+  timeoutMs: number,
+  preClick?: SendEffectState,
+  logger?: BrowserLogger,
+): Promise<SendClickOutcome> {
+  const expression = `(() => {
+    const state = ${buildSendEffectStateExpression()};
+    return { ...state, clickSeen: window.__oracleSendClickSeen };
+  })()`;
+  const turnsFloor = preClick?.turnsCount ?? -1;
+  const deadline = Date.now() + timeoutMs;
+  do {
+    // Both unreadable cases below keep the conservative default (never retry on
+    // an unproven miss) but say which one happened, so a commit timeout later
+    // has a record of why verification passed.
+    let value: (SendEffectState & { clickSeen?: unknown }) | undefined;
+    try {
+      const res = await Runtime.evaluate({ expression, returnByValue: true });
+      value = res?.result?.value as (SendEffectState & { clickSeen?: unknown }) | undefined;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger?.(`Send-click verification probe threw: ${message}; skipping retry`);
+      return "unknown";
+    }
+    if (!value || typeof value !== "object" || typeof value.clickSeen !== "boolean") {
+      logger?.(
+        "Send-click verification could not read the trusted-click marker (execution context destroyed?); skipping retry",
+      );
+      return "unknown";
+    }
+    if (value.clickSeen) {
+      return "landed";
+    }
+    // Composer clearing only counts when the composer held text pre-click; an
+    // empty composer for any other reason (a lost draft) must not pass.
+    const cleared = value.composerCleared === true && preClick?.composerCleared === false;
+    const stopAppeared = value.stopVisible === true && preClick?.stopVisible !== true;
+    const hasNewTurn =
+      turnsFloor >= 0 && typeof value.turnsCount === "number" && value.turnsCount > turnsFloor;
+    if (cleared || stopAppeared || hasNewTurn) {
+      return "landed";
+    }
+    await delay(250);
+  } while (Date.now() < deadline);
+  return "missed";
+}
+
 async function attemptSendButton(
   Runtime: ChromeClient["Runtime"],
   Input: ChromeClient["Input"],
@@ -555,7 +657,6 @@ async function attemptSendButton(
 ): Promise<boolean> {
   const needAttachment = Array.isArray(attachmentNames) && attachmentNames.length > 0;
   const script = `(() => {
-    ${buildClickDispatcher()}
     const selectors = ${JSON.stringify(SEND_BUTTON_SELECTORS)};
     const isVisible = (node) => {
       if (!(node instanceof HTMLElement)) return false;
@@ -582,6 +683,24 @@ async function attemptSendButton(
     }
     const button = candidates.find((node) => isVisible(node) && isEnabled(node)) || null;
     if (!button) return { status: 'missing' };
+    // Arm a marker that tells a click which never reached the send button apart
+    // from one that landed but has not shown an effect yet. The listener sits on
+    // the document, not on this button node: React can swap the node between
+    // arming and the click, and a listener on the detached node would miss the
+    // very click that sent the prompt. Only isTrusted events arm it -- ChatGPT
+    // ignores synthetic ones, so they are not evidence either.
+    if (!window.__oracleSendClickListener) {
+      window.__oracleSendClickListener = (event) => {
+        if (!event.isTrusted) return;
+        const target = event.target;
+        if (target && typeof target.closest === 'function' && target.closest(selectors.join(','))) {
+          window.__oracleSendClickSeen = true;
+        }
+      };
+      document.addEventListener('click', window.__oracleSendClickListener, { capture: true });
+    }
+    // Reset before every click so the marker only ever describes the next one.
+    window.__oracleSendClickSeen = false;
     const rect = button.getBoundingClientRect();
     if (rect.width > 0 && rect.height > 0) {
       const x = rect.left + rect.width / 2;
@@ -594,11 +713,12 @@ async function attemptSendButton(
       }
       const hit = document.elementFromPoint(x, y);
       if (!hit || !button.contains(hit)) return { status: 'settling' };
-      return { status: 'point', x, y };
+      return { status: 'point', x, y, state: ${buildSendEffectStateExpression()} };
     }
-    // Last-resort fallback for unusual DOMs where the button is visible but has no useful rect.
-    dispatchClickSequence(button);
-    return { status: 'clicked' };
+    // The button lost its box between the visibility check and this read, so a
+    // re-render replaced it: a stale candidate is not a click target, and a
+    // synthetic click on it could not be verified. Re-query instead.
+    return { status: 'stale' };
   })()`;
 
   // Give attachment-bearing submissions more headroom. ChatGPT's chip render can
@@ -609,6 +729,8 @@ async function attemptSendButton(
   let previousPoint: { x: number; y: number } | undefined;
   let activated = false;
   let foundButton = false;
+  let clickAttempts = 0;
+  let lastPreClick: SendEffectState | undefined;
   while (Date.now() < deadline) {
     if (needAttachment) {
       const ready = await Runtime.evaluate({
@@ -628,7 +750,12 @@ async function attemptSendButton(
     }
     const { result } = await Runtime.evaluate({ expression: script, returnByValue: true });
     const value = result.value as
-      | { status?: "clicked" | "missing" | "point" | "settling"; x?: number; y?: number }
+      | {
+          status?: "missing" | "point" | "settling" | "stale";
+          x?: number;
+          y?: number;
+          state?: SendEffectState;
+        }
       | string
       | undefined;
     const status = typeof value === "string" ? value : value?.status;
@@ -648,17 +775,66 @@ async function attemptSendButton(
         await delay(150);
         continue;
       }
+      const preClick = value.state;
+      lastPreClick = preClick ?? lastPreClick;
+      clickAttempts += 1;
       await clickTrustedPoint(Runtime, Input, value.x, value.y);
-      return true;
+      if ((await confirmSendClick(Runtime, SEND_CLICK_VERIFY_MS, preClick, logger)) !== "missed") {
+        return true;
+      }
+      logger?.(
+        `Send click ${clickAttempts} at (${Math.round(value.x)}, ${Math.round(value.y)}) had no observed effect within 2.5s and the trusted-click marker never armed${
+          clickAttempts < SEND_CLICK_MAX_ATTEMPTS ? "; re-measuring and retrying" : ""
+        }`,
+      );
+      if (clickAttempts >= SEND_CLICK_MAX_ATTEMPTS) {
+        break;
+      }
+      // Re-measure from scratch: the retry must re-activate the target and pass
+      // the two-sample stability check again rather than reuse the coordinates
+      // that just missed.
+      previousPoint = undefined;
+      activated = false;
+      continue;
     }
-    if (status === "clicked") {
-      return true;
+    if (status === "stale") {
+      previousPoint = undefined;
+      await delay(100);
+      continue;
     }
     if (status === "missing") {
+      if (clickAttempts > 0) {
+        // The button vanished after a click. That usually means the send worked
+        // (it swaps to the stop control), but a transiently disabled button
+        // reports the same way, so confirm instead of assuming.
+        if ((await confirmSendClick(Runtime, 1_500, lastPreClick, logger)) !== "missed") {
+          return true;
+        }
+        await delay(250);
+        continue;
+      }
       break;
     }
     previousPoint = undefined;
     await delay(100);
+  }
+  if (clickAttempts > 0) {
+    // Every click was a proven miss. Do not pretend the send happened: let
+    // text-only submissions fall back to the Enter key, and fail attachment
+    // submissions fast with a structured error instead of burning the whole
+    // commit window on a prompt that was never sent.
+    if (needAttachment) {
+      throw new BrowserAutomationError(
+        `Send click missed the button ${clickAttempts} time(s); the composer layout may be shifting.`,
+        {
+          stage: "submit-prompt",
+          code: "send-click-missed",
+          clickAttempts,
+          attachmentNames,
+        },
+      );
+    }
+    return false;
   }
   if (Array.isArray(attachmentNames) && attachmentNames.length > 0) {
     throw new BrowserAutomationError(
@@ -926,4 +1102,5 @@ export const __test__ = {
   attemptSendButton,
   sendButtonTimeoutMs,
   verifyPromptCommitted,
+  confirmSendClick,
 };
