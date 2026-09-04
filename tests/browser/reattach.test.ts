@@ -299,6 +299,83 @@ describe("resumeBrowserSession", () => {
       }),
     );
   });
+  test("live reattach outlives timeoutMs while the waiter reports ChatGPT still working", async () => {
+    vi.useFakeTimers();
+    try {
+      // No chromeProfileRoot: skips the DevToolsActivePort file probe, which does not run under
+      // fake timers and is irrelevant to the wait-budget guard being tested here.
+      const runtime = {
+        chromeBrowserWSEndpoint: "ws://127.0.0.1:9222/devtools/browser/abc",
+        tabUrl: "https://chatgpt.com/c/abc",
+        chromeTargetId: "target-2",
+      };
+      const listTargets = vi.fn(
+        async () =>
+          [
+            { targetId: "target-2", type: "page", url: "https://chatgpt.com/c/abc" },
+          ] satisfies FakeTarget[],
+      ) as unknown as () => Promise<FakeTarget[]>;
+      const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression === "location.href") {
+          return { result: { value: runtime.tabUrl } };
+        }
+        if (expression === "1+1") {
+          return { result: { value: 2 } };
+        }
+        return { result: { value: null } };
+      });
+      const connect = vi.fn(
+        async () =>
+          ({
+            Runtime: { enable: vi.fn(), evaluate },
+            DOM: { enable: vi.fn() },
+            close: vi.fn(async () => {}),
+          }) satisfies FakeClient,
+      ) as unknown as (options?: unknown) => Promise<ChromeClient>;
+      // The waiter itself decides when the answer has stalled (inactivity budget); here it keeps
+      // going for 10s on a 2s timeoutMs, past the old `timeoutMs + 5s` outer guard (7s).
+      const waitForAssistantResponse = vi.fn(
+        () =>
+          new Promise<{ text: string; html: string; meta: { messageId: string; turnId: string } }>(
+            (resolve) => {
+              setTimeout(
+                () =>
+                  resolve({
+                    text: "attached",
+                    html: "",
+                    meta: { messageId: "m1", turnId: "conversation-turn-1" },
+                  }),
+                10_000,
+              );
+            },
+          ),
+      );
+      const captureAssistantMarkdown = vi.fn(async () => "attached-md");
+      const logger = vi.fn() as BrowserLogger;
+
+      const promise = resumeBrowserSession(
+        runtime,
+        { attachRunning: true, timeoutMs: 2_000 },
+        logger,
+        {
+          listTargets,
+          connect,
+          waitForAssistantResponse,
+          captureAssistantMarkdown,
+          waitForConversationHydration: vi.fn(async () => 2),
+        },
+      );
+      await vi.advanceTimersByTimeAsync(20_000);
+
+      await expect(promise).resolves.toMatchObject({ answerMarkdown: "attached-md" });
+      expect(logger).not.toHaveBeenCalledWith(
+        expect.stringContaining("Reattach response timed out"),
+      );
+      expect(connect).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
   test("closes the attached client before falling back to recovery", async () => {
     const runtime = {

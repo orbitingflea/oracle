@@ -42,6 +42,7 @@ import {
   type TargetInfoLite,
 } from "./reattachHelpers.js";
 import { waitForDeepResearchCompletion } from "./actions/deepResearch.js";
+import { resolveAssistantWaitCeilingMs } from "./actions/assistantResponse.js";
 import { CHROME_COOKIE_SYNC_WARNING, shouldSyncBrowserCookies } from "./policies.js";
 
 export interface ReattachDeps {
@@ -212,9 +213,11 @@ export async function resumeBrowserSession(
       };
     }
     const promptEcho = buildPromptEchoMatcher(deps.promptPreview);
+    // The waiter treats `timeoutMs` as an inactivity budget and keeps going while ChatGPT is
+    // visibly working, so the outer guard must be bounded by its hard ceiling, not `timeoutMs`.
     const answer = await withTimeout(
       waitForResponse(Runtime, timeoutMs, logger, minTurnIndex ?? undefined),
-      timeoutMs + 5_000,
+      resolveAssistantWaitCeilingMs(timeoutMs) + 5_000,
       "Reattach response timed out",
     );
     const recovered = await recoverPromptEcho(

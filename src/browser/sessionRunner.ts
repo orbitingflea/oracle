@@ -11,7 +11,9 @@ import type {
 } from "../sessionStore.js";
 import { runBrowserMode } from "../browserMode.js";
 import type { BrowserRunResult } from "../browserMode.js";
-import { DEFAULT_BROWSER_CONFIG } from "./config.js";
+import { DEFAULT_BROWSER_CONFIG, resolveBrowserConfig } from "./config.js";
+import { resolveAssistantWaitCeilingMs } from "./actions/assistantResponse.js";
+import { formatElapsed } from "../oracle/format.js";
 import { assembleBrowserPrompt } from "./prompt.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 import type { BrowserArchiveResult, BrowserLogger } from "./types.js";
@@ -131,6 +133,20 @@ function buildBrowserRunWarnings(args: {
   ];
 }
 
+// Describes the effective wait policy (custom --browser-timeout, Deep Research default, or the
+// normal default) so the banner never promises a budget the run does not actually have.
+export function formatBrowserWaitBudgetLine(browserConfig: BrowserSessionConfig): string {
+  const { timeoutMs, researchMode } = resolveBrowserConfig(browserConfig);
+  if (researchMode === "deep") {
+    return `Deep Research runs are given up on after ${formatElapsed(timeoutMs)}.`;
+  }
+  return (
+    `This run may take a while: Oracle keeps waiting while ChatGPT is visibly working ` +
+    `(up to ${formatElapsed(resolveAssistantWaitCeilingMs(timeoutMs))}) and gives up after ` +
+    `${formatElapsed(timeoutMs)} without visible progress.`
+  );
+}
+
 export async function runBrowserSessionExecution(
   { runOptions, browserConfig, cwd, log }: RunBrowserSessionArgs,
   deps: BrowserSessionRunnerDeps = {},
@@ -219,7 +235,7 @@ export async function runBrowserSessionExecution(
   automationLogger.sessionLog = runOptions.verbose ? log : () => {};
 
   log(headerLine);
-  log(chalk.dim("This run can take up to an hour (usually ~10 minutes)."));
+  log(chalk.dim(formatBrowserWaitBudgetLine(browserConfig)));
   if (runOptions.verbose) {
     log(chalk.dim("Chrome automation does not stream output; this may take a minute..."));
   }

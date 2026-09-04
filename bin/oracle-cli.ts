@@ -666,7 +666,7 @@ program
   .addOption(
     new Option(
       "--browser-timeout <ms|s|m>",
-      "Maximum time to wait for an answer (default 1200s / 20m).",
+      "Give up after this long with no visible ChatGPT progress (default 20m; Deep Research keeps a hard 40m cap). Oracle keeps waiting while ChatGPT is visibly working, up to 3h or this value, whichever is longer.",
     ).hideHelp(),
   )
   .addOption(
@@ -2884,7 +2884,7 @@ function printDebugHelp(cliName: string): void {
       "Attach to your current Chrome session through its local remote debugging toggle.",
     ],
     ["--browser-url <url>", "Alias for --chatgpt-url."],
-    ["--browser-timeout <ms|s|m>", "Cap total wait time for the assistant response."],
+    ["--browser-timeout <ms|s|m>", "Give up after this long with no visible ChatGPT progress."],
     ["--browser-input-timeout <ms|s|m>", "Cap how long we wait for the composer textarea."],
     [
       "--browser-recheck-delay <ms|s|m|h>",

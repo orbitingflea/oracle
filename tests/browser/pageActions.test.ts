@@ -24,6 +24,11 @@ import * as attachments from "../../src/browser/actions/attachments.js";
 import * as attachmentDataTransfer from "../../src/browser/actions/attachmentDataTransfer.js";
 import type { ChromeClient } from "../../src/browser/types.js";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
+import {
+  pollAssistantCompletionForTest,
+  resolveAssistantWaitCeilingMs,
+} from "../../src/browser/actions/assistantResponse.js";
+import { ASSISTANT_ACTIVE_WAIT_CEILING_MS } from "../../src/browser/constants.js";
 
 const logger = vi.fn();
 
@@ -1559,7 +1564,8 @@ describe("waitForAssistantResponse", () => {
         logger,
       );
       const assertion = expect(promise).rejects.toThrow(/refusing to finalize/i);
-      await vi.advanceTimersByTimeAsync(16_000);
+      // The confirmation poll gets the full inactivity budget from the moment of capture.
+      await vi.advanceTimersByTimeAsync(32_000);
       await assertion;
     } finally {
       vi.useRealTimers();
@@ -1593,6 +1599,181 @@ describe("waitForAssistantResponse", () => {
       await vi.advanceTimersByTimeAsync(16_000);
       await assertion;
       expect(terminateExecution).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test.each([false, true])(
+    "keeps waiting during generation after observer failure=%s",
+    async (observerFails) => {
+      vi.useFakeTimers();
+      try {
+        const startedAt = Date.now();
+        const answer = {
+          text: "Final answer after a long Pro thinking phase.",
+          messageId: "mid",
+          turnId: "tid",
+        };
+        // No answer text, but strong liveness evidence (Stop control, thinking indicator) for 12s:
+        // more than twice the 5s timeout.
+        const generating = () => Date.now() - startedAt < 12_000;
+        const evaluate = vi
+          .fn()
+          .mockImplementation(async (params: { expression?: string; awaitPromise?: boolean }) => {
+            if (params.awaitPromise) {
+              if (observerFails) throw new Error("Execution context was destroyed");
+              return new Promise(() => undefined);
+            }
+            const expression = String(params.expression ?? "");
+            if (expression.includes("extractAssistantTurn")) {
+              return { result: { value: generating() ? null : answer } };
+            }
+            if (expression.includes("Find the LAST assistant turn")) {
+              return { result: { value: !generating() } };
+            }
+            if (expression.includes("readThinkingActivity")) {
+              return { result: { value: { active: generating(), strong: generating() } } };
+            }
+            if (expression.includes("isStopControlVisible")) {
+              return { result: { value: generating() } };
+            }
+            return { result: { value: false } };
+          });
+        const terminateExecution = vi.fn().mockResolvedValue(undefined);
+        let settled = false;
+        const promise = waitForAssistantResponse(
+          { evaluate, terminateExecution } as unknown as ChromeClient["Runtime"],
+          5_000,
+          logger,
+        );
+        promise.then(
+          () => {
+            settled = true;
+          },
+          () => {
+            settled = true;
+          },
+        );
+
+        await vi.advanceTimersByTimeAsync(6_000);
+        // Past the 5s timeout, but the page still shows generation: no give-up.
+        expect(settled).toBe(false);
+        await vi.advanceTimersByTimeAsync(14_000);
+        await expect(promise).resolves.toMatchObject({ text: answer.text });
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  test("gives up once the timeout passes with no visible generation", async () => {
+    vi.useFakeTimers();
+    try {
+      const startedAt = Date.now();
+      // Visibly generating for 3s, then the page goes quiet without ever producing an answer.
+      const generating = () => Date.now() - startedAt < 3_000;
+      const evaluate = vi
+        .fn()
+        .mockImplementation(async (params: { expression?: string; awaitPromise?: boolean }) => {
+          if (params.awaitPromise) {
+            return new Promise(() => undefined);
+          }
+          const expression = String(params.expression ?? "");
+          if (expression.includes("readThinkingActivity")) {
+            return { result: { value: { active: generating(), strong: generating() } } };
+          }
+          if (expression.includes("isStopControlVisible")) {
+            return { result: { value: generating() } };
+          }
+          return { result: { value: null } };
+        });
+      const terminateExecution = vi.fn().mockResolvedValue(undefined);
+      let settled = false;
+      const promise = waitForAssistantResponse(
+        { evaluate, terminateExecution } as unknown as ChromeClient["Runtime"],
+        5_000,
+        logger,
+      );
+      const assertion = expect(promise).rejects.toThrow(/watchdog-timeout/i);
+      promise.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        },
+      );
+
+      // 6s in: only 3s of inactivity so far, the 5s budget is not spent yet.
+      await vi.advanceTimersByTimeAsync(6_000);
+      expect(settled).toBe(false);
+      // 3s active + 5s inactive = 8s: now it gives up.
+      await vi.advanceTimersByTimeAsync(4_000);
+      await assertion;
+      expect(terminateExecution).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("stops at the hard ceiling even when the page looks active forever", async () => {
+    vi.useFakeTimers();
+    try {
+      // A stuck spinner: strong activity on every sample, never an answer.
+      const evaluate = vi.fn().mockImplementation(async (params: { expression?: string }) => {
+        const expression = String(params.expression ?? "");
+        if (expression.includes("readThinkingActivity")) {
+          return { result: { value: { active: true, strong: true } } };
+        }
+        return { result: { value: null } };
+      });
+      let settled = false;
+      const promise = pollAssistantCompletionForTest(
+        { evaluate } as unknown as ChromeClient["Runtime"],
+        1_000,
+        undefined,
+        undefined,
+        undefined,
+        Date.now() + 3_000,
+      );
+      promise.then(() => {
+        settled = true;
+      });
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(promise).resolves.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("hard ceiling is 3h unless the configured timeout is longer", () => {
+    expect(resolveAssistantWaitCeilingMs(1_200_000)).toBe(ASSISTANT_ACTIVE_WAIT_CEILING_MS);
+    expect(ASSISTANT_ACTIVE_WAIT_CEILING_MS).toBe(3 * 60 * 60 * 1000);
+    expect(resolveAssistantWaitCeilingMs(5 * 60 * 60 * 1000)).toBe(5 * 60 * 60 * 1000);
+  });
+
+  test("in-page observer is bounded by the hard ceiling, not the inactivity timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      let capturedExpression = "";
+      const runtime = {
+        evaluate: vi.fn().mockImplementation((params) => {
+          if (params?.awaitPromise) {
+            capturedExpression = String(params?.expression ?? "");
+            throw new Error("stop");
+          }
+          return { result: { value: null } };
+        }),
+      } as unknown as ChromeClient["Runtime"];
+      await expect(waitForAssistantResponse(runtime, 100, logger)).rejects.toThrow("stop");
+      expect(capturedExpression).toContain(
+        `const deadline = Date.now() + ${ASSISTANT_ACTIVE_WAIT_CEILING_MS};`,
+      );
+      expect(capturedExpression).not.toContain("const deadline = Date.now() + 100;");
     } finally {
       vi.useRealTimers();
     }

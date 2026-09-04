@@ -4021,7 +4021,9 @@ async function waitForAssistantResponseWithReload(
     if (!conversationUrl || !isConversationUrl(conversationUrl)) {
       throw error;
     }
-    logger("Assistant response stalled; reloading conversation and retrying once");
+    // `[browser]` prefix so the non-verbose log filter keeps it; a silent reload mid-run is
+    // indistinguishable from a hang.
+    logger("[browser] Assistant response stalled; reloading conversation and retrying once");
     await Page.navigate({ url: conversationUrl });
     await waitForResumedConversationHydration(Runtime, timeoutMs, logger, {
       requirePriorTurns: true,
