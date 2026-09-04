@@ -1,4 +1,4 @@
-const CONVERSATION_ID_PATH = /\/c\/([a-zA-Z0-9-]+)(?=[/?#]|$)/;
+export const CONVERSATION_ID_PATH = /\/c\/([a-zA-Z0-9-]+)(?=[/?#]|$)/;
 
 /**
  * Extract a durable ChatGPT conversation id from a URL.

@@ -41,6 +41,8 @@ export interface BrowserDownloadableFile {
   filename?: string;
   label?: string;
   mimeType?: string;
+  /** Assistant message id (`data-message-id`) of the turn that rendered the file, when known. */
+  messageId?: string;
 }
 
 export interface SavedBrowserImage extends SessionArtifact {

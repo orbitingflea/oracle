@@ -8,6 +8,7 @@ import type {
 } from "./types.js";
 import { ASSISTANT_ROLE_SELECTOR } from "./constants.js";
 import { buildConversationTurnListExpression } from "./conversationTurns.js";
+import { CONVERSATION_ID_PATH } from "./conversationUrl.js";
 import {
   computeFileSha256,
   resolveSessionArtifactsDir,
@@ -136,7 +137,6 @@ function classifyUrlKind(value?: string | null): string {
     const url = new URL(raw, CHATGPT_DOWNLOAD_BASE_URL);
     if (!isAllowedChatGptHost(url.hostname)) return "external-https";
     const pathName = url.pathname.toLowerCase();
-    if (pathName === "/backend-api/sandbox/download") return "chatgpt-sandbox-download";
     if (/^\/backend-api\/files\/[^/]+\/(?:download|content)\/?$/.test(pathName)) {
       return "chatgpt-file-endpoint";
     }
@@ -190,9 +190,6 @@ function isSafeSandboxPath(value?: string | null): boolean {
 
 function isKnownChatGptFileDownloadUrl(url: URL): boolean {
   const pathName = url.pathname.toLowerCase();
-  if (pathName === "/backend-api/sandbox/download") {
-    return isSafeSandboxPath(url.searchParams.get("path"));
-  }
   if (/^\/backend-api\/files\/[^/]+\/(?:download|content)\/?$/.test(pathName)) {
     return true;
   }
@@ -244,16 +241,6 @@ function normalizeSandboxUrl(value?: string | null): string | undefined {
   return pathName ? `sandbox:${pathName}` : undefined;
 }
 
-function downloadUrlFromSandboxUrl(value?: string | null): string | undefined {
-  const pathName = normalizeSandboxPath(value);
-  if (!pathName) {
-    return undefined;
-  }
-  const url = new URL("/backend-api/sandbox/download", CHATGPT_DOWNLOAD_BASE_URL);
-  url.searchParams.set("path", pathName);
-  return url.href;
-}
-
 function dedupeFiles(files: BrowserDownloadableFile[]): BrowserDownloadableFile[] {
   const deduped: BrowserDownloadableFile[] = [];
   const aliases = new Map<string, number>();
@@ -281,6 +268,7 @@ function dedupeFiles(files: BrowserDownloadableFile[]): BrowserDownloadableFile[
       filename: existing.filename ?? file.filename,
       label: existing.label ?? file.label,
       mimeType: existing.mimeType ?? file.mimeType,
+      messageId: existing.messageId ?? file.messageId,
       url:
         existing.downloadUrl ??
         file.downloadUrl ??
@@ -344,20 +332,12 @@ function buildAssistantDownloadableFilesExpression(minTurnIndex?: number): strin
     const isChatGptDownloadUrl = (value) => {
       const raw = String(value || '').trim();
       if (!raw || raw.startsWith('sandbox:') || raw.startsWith('blob:')) return false;
-      const isSafeSandboxPath = (path) => {
-        const value = String(path || '');
-        return value.startsWith('/mnt/data/') &&
-          !value.includes('\\\\') &&
-          !value.includes('\\0') &&
-          !value.split('/').includes('..');
-      };
       try {
         const url = new URL(raw, location.origin || 'https://chatgpt.com');
         const host = url.hostname.toLowerCase();
         const allowedHost = host === 'chatgpt.com' || host === 'chat.openai.com';
         const pathName = url.pathname.toLowerCase();
         const isKnownFileDownload =
-          (pathName === '/backend-api/sandbox/download' && isSafeSandboxPath(url.searchParams.get('path') || '')) ||
           /^\\/backend-api\\/files\\/[^/]+\\/(?:download|content)\\/?$/.test(pathName) ||
           (pathName === '/backend-api/estuary/content' && String(url.searchParams.get('id') || '').startsWith('file_'));
         return allowedHost && url.protocol === 'https:' && !url.port && isKnownFileDownload;
@@ -445,7 +425,10 @@ function buildAssistantDownloadableFilesExpression(minTurnIndex?: number): strin
       if (!isAssistantTurn(turn)) continue;
       if (MIN_TURN_INDEX >= 0 && index < MIN_TURN_INDEX) continue;
       const messageRoot = turn.querySelector(ASSISTANT_SELECTOR) || turn;
-      files.push(...serializeFiles(messageRoot));
+      const messageId = messageRoot.getAttribute('data-message-id') ||
+        turn.getAttribute('data-message-id') ||
+        turn.querySelector('[data-message-id]')?.getAttribute('data-message-id') || '';
+      files.push(...serializeFiles(messageRoot).map((file) => ({ ...file, messageId })));
     }
     return files;
   })()`;
@@ -478,6 +461,7 @@ export async function readAssistantDownloadableFiles(
       filename: typeof item?.filename === "string" ? item.filename : undefined,
       label: typeof item?.label === "string" ? item.label : undefined,
       mimeType: typeof item?.mimeType === "string" ? item.mimeType : undefined,
+      messageId: typeof item?.messageId === "string" && item.messageId ? item.messageId : undefined,
     });
   }
   return dedupeFiles(normalized);
@@ -780,20 +764,12 @@ function buildClickAssistantDownloadButtonsExpression(
     const isChatGptDownloadUrl = (value) => {
       const raw = String(value || '').trim();
       if (!raw || raw.startsWith('sandbox:') || raw.startsWith('blob:')) return false;
-      const isSafeSandboxPath = (pathName) => {
-        const normalized = String(pathName || '');
-        return normalized.startsWith('/mnt/data/') &&
-          !normalized.includes('\\\\') &&
-          !normalized.includes('\\0') &&
-          !normalized.split('/').includes('..');
-      };
       try {
         const url = new URL(raw, 'https://chatgpt.com');
         const host = url.hostname.toLowerCase();
         const allowedHost = host === 'chatgpt.com' || host === 'chat.openai.com';
         const pathName = url.pathname.toLowerCase();
         const isKnownFileDownload =
-          (pathName === '/backend-api/sandbox/download' && isSafeSandboxPath(url.searchParams.get('path') || '')) ||
           /^\\/backend-api\\/files\\/[^/]+\\/(?:download|content)\\/?$/.test(pathName) ||
           (pathName === '/backend-api/estuary/content' && String(url.searchParams.get('id') || '').startsWith('file_'));
         return allowedHost && url.protocol === 'https:' && !url.port && isKnownFileDownload;
@@ -1224,9 +1200,7 @@ export async function saveAssistantDownloadButtonArtifacts(params: {
         )}`,
       );
     } else {
-      const explicitDownloadUrl = normalizeChatGptDownloadUrl(file.downloadUrl ?? file.url);
-      const sandboxDownloadUrl = downloadUrlFromSandboxUrl(file.sandboxUrl ?? file.url);
-      const downloadUrl = explicitDownloadUrl ?? sandboxDownloadUrl;
+      const downloadUrl = normalizeChatGptDownloadUrl(file.downloadUrl ?? file.url);
       if (downloadUrl) {
         params.logger?.(
           `[browser] No matching assistant control for ${sanitizeCandidateFilename(
@@ -1379,6 +1353,122 @@ async function fetchDownloadWithNode(
   });
 }
 
+// Resolve sandbox paths in the page so the session token stays in the browser.
+// Try the link's message first, followed by other assistant messages in this run.
+function buildSandboxDownloadResolveExpression(params: {
+  sandboxPath: string;
+  messageId?: string;
+  minTurnIndex?: number;
+}): string {
+  const minTurnLiteral =
+    typeof params.minTurnIndex === "number" &&
+    Number.isFinite(params.minTurnIndex) &&
+    params.minTurnIndex >= 0
+      ? Math.floor(params.minTurnIndex)
+      : -1;
+  return `(async () => {
+    const SANDBOX_PATH = ${JSON.stringify(params.sandboxPath)};
+    const OWNER_MESSAGE_ID = ${JSON.stringify(params.messageId ?? "")};
+    const MIN_TURN_INDEX = ${minTurnLiteral};
+    const ASSISTANT_SELECTOR = ${JSON.stringify(ASSISTANT_ROLE_SELECTOR)};
+    const conversationId = (new RegExp(${JSON.stringify(CONVERSATION_ID_PATH.source)}).exec(location.pathname) || [])[1];
+    if (!conversationId) {
+      return { ok: false, error: 'page URL has no durable /c/<conversation-id>' };
+    }
+    const isAssistantTurn = (node) => {
+      if (!(node instanceof HTMLElement)) return false;
+      const turnAttr = (node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
+      if (turnAttr === 'assistant') return true;
+      const role = (node.getAttribute('data-message-author-role') || node.dataset?.messageAuthorRole || '').toLowerCase();
+      if (role === 'assistant') return true;
+      const testId = (node.getAttribute('data-testid') || '').toLowerCase();
+      if (testId.includes('assistant')) return true;
+      return Boolean(node.querySelector(ASSISTANT_SELECTOR) || node.querySelector('[data-testid*="assistant"]'));
+    };
+    const messageIds = OWNER_MESSAGE_ID ? [OWNER_MESSAGE_ID] : [];
+    const turns = ${buildConversationTurnListExpression()};
+    for (let index = turns.length - 1; index >= 0; index -= 1) {
+      const turn = turns[index];
+      if (!isAssistantTurn(turn)) continue;
+      if (MIN_TURN_INDEX >= 0 && index < MIN_TURN_INDEX) continue;
+      const messageRoot = turn.querySelector(ASSISTANT_SELECTOR) || turn;
+      const messageId = messageRoot.getAttribute('data-message-id') ||
+        turn.getAttribute('data-message-id') ||
+        turn.querySelector('[data-message-id]')?.getAttribute('data-message-id') || '';
+      if (messageId && !messageIds.includes(messageId)) messageIds.push(messageId);
+    }
+    if (messageIds.length === 0) {
+      return { ok: false, error: 'no assistant message id found in the current run' };
+    }
+    const sessionResponse = await fetch('/api/auth/session', { credentials: 'include' });
+    const session = sessionResponse.ok ? await sessionResponse.json().catch(() => null) : null;
+    const accessToken = session && typeof session.accessToken === 'string' ? session.accessToken : '';
+    if (!accessToken) {
+      return { ok: false, error: 'ChatGPT session did not provide an access token', status: sessionResponse.status };
+    }
+    const statuses = [];
+    for (const messageId of messageIds) {
+      const resolveUrl = '/backend-api/conversation/' + encodeURIComponent(conversationId) +
+        '/interpreter/download?message_id=' + encodeURIComponent(messageId) +
+        '&sandbox_path=' + encodeURIComponent(SANDBOX_PATH);
+      const response = await fetch(resolveUrl, {
+        credentials: 'include',
+        headers: { authorization: 'Bearer ' + accessToken },
+      });
+      const payload = response.ok ? await response.json().catch(() => null) : null;
+      if (payload && typeof payload.download_url === 'string') {
+        return { ok: true, downloadUrl: payload.download_url, messageId };
+      }
+      statuses.push(response.status);
+    }
+    return {
+      ok: false,
+      error: 'interpreter download resolve failed for ' + messageIds.length + ' assistant message id(s)',
+      statuses,
+    };
+  })()`;
+}
+
+async function resolveSandboxDownloadUrl(params: {
+  Runtime: ChromeClient["Runtime"];
+  sandboxPath: string;
+  messageId?: string;
+  minTurnIndex?: number;
+}): Promise<string> {
+  if (!isSafeSandboxPath(params.sandboxPath)) {
+    throw new ChatGptDownloadError("unsafe sandbox path rejected");
+  }
+  const { result, exceptionDetails } = await params.Runtime.evaluate({
+    expression: buildSandboxDownloadResolveExpression(params),
+    awaitPromise: true,
+    returnByValue: true,
+  });
+  if (exceptionDetails) {
+    throw new ChatGptDownloadError("sandbox download resolve threw in browser context");
+  }
+  const value = result?.value as
+    | { downloadUrl?: string; error?: string; ok?: boolean; status?: number; statuses?: number[] }
+    | undefined;
+  if (!value?.ok || typeof value.downloadUrl !== "string") {
+    const statuses = Array.isArray(value?.statuses) ? value.statuses.join(",") : value?.status;
+    throw new ChatGptDownloadError(
+      `sandbox download resolve failed${statuses ? ` status=${statuses}` : ""}: ${safeDiagnosticText(
+        value?.error ?? "browser resolve returned no value",
+        180,
+      )}`,
+    );
+  }
+  const downloadUrl = normalizeChatGptDownloadUrl(value.downloadUrl);
+  if (!downloadUrl) {
+    throw new ChatGptDownloadError(
+      `sandbox download resolve returned an unsupported download URL (urlKind=${classifyUrlKind(
+        value.downloadUrl,
+      )})`,
+    );
+  }
+  return downloadUrl;
+}
+
 async function fetchDownloadWithBrowser(
   Runtime: ChromeClient["Runtime"],
   downloadUrl: string,
@@ -1456,6 +1546,7 @@ export async function saveChatGptDownloadableFiles(params: {
   files: BrowserDownloadableFile[];
   sessionId?: string;
   logger?: BrowserLogger;
+  minTurnIndex?: number | null;
 }): Promise<{
   saved: boolean;
   fileCount: number;
@@ -1485,9 +1576,10 @@ export async function saveChatGptDownloadableFiles(params: {
   for (let index = 0; index < files.length; index += 1) {
     const file = files[index];
     const explicitDownloadUrl = normalizeChatGptDownloadUrl(file.downloadUrl ?? file.url);
-    const sandboxDownloadUrl = downloadUrlFromSandboxUrl(file.sandboxUrl ?? file.url);
-    const downloadUrl = explicitDownloadUrl ?? sandboxDownloadUrl;
-    if (!downloadUrl) {
+    const sandboxPath = explicitDownloadUrl
+      ? undefined
+      : normalizeSandboxPath(file.sandboxUrl ?? file.url);
+    if (!explicitDownloadUrl && !sandboxPath) {
       const source = sanitizeCandidateFilename(file.sandboxUrl ?? file.filename ?? file.url);
       const message = `${source}: no ChatGPT download URL found`;
       errors.push(message);
@@ -1495,15 +1587,31 @@ export async function saveChatGptDownloadableFiles(params: {
       logger?.(`[browser] Skipping downloadable file ${index + 1}/${files.length}: ${message}`);
       continue;
     }
-    const strategy: DirectDownloadStrategy =
-      params.Runtime && sandboxDownloadUrl && !explicitDownloadUrl ? "browser-fetch" : "node-fetch";
+    const strategy: DirectDownloadStrategy = sandboxPath ? "browser-fetch" : "node-fetch";
     logger?.(
       `[browser] Download candidate ${index + 1}/${files.length}: ${describeDownloadableCandidate(
         file,
-        downloadUrl,
+        explicitDownloadUrl,
       )} strategy=${strategy}`,
     );
     try {
+      let downloadUrl = explicitDownloadUrl;
+      if (!downloadUrl) {
+        if (!params.Runtime) {
+          throw new ChatGptDownloadError("browser runtime required to resolve sandbox download");
+        }
+        downloadUrl = await resolveSandboxDownloadUrl({
+          Runtime: params.Runtime,
+          sandboxPath: sandboxPath as string,
+          messageId: file.messageId,
+          minTurnIndex: params.minTurnIndex ?? undefined,
+        });
+        logger?.(
+          `[browser] Resolved sandbox download ${index + 1}/${files.length} via interpreter endpoint; urlKind=${classifyUrlKind(
+            downloadUrl,
+          )}.`,
+        );
+      }
       const downloaded =
         strategy === "browser-fetch"
           ? await fetchDownloadWithBrowser(params.Runtime as ChromeClient["Runtime"], downloadUrl)
@@ -1551,7 +1659,7 @@ export async function saveChatGptDownloadableFiles(params: {
       logger?.(
         `[browser] Failed to save downloadable file ${index + 1}/${files.length} (${describeDownloadableCandidate(
           file,
-          downloadUrl,
+          explicitDownloadUrl,
         )} strategy=${strategy}): ${safeMessage}`,
       );
     }
@@ -1602,12 +1710,10 @@ export async function collectChatGptFileArtifacts(params: {
   }
   params.logger?.(`[browser] Found ${allFiles.length} downloadable file candidate(s).`);
   allFiles.forEach((file, index) => {
-    const explicitDownloadUrl = normalizeChatGptDownloadUrl(file.downloadUrl ?? file.url);
-    const sandboxDownloadUrl = downloadUrlFromSandboxUrl(file.sandboxUrl ?? file.url);
     params.logger?.(
       `[browser] Candidate ${index + 1}/${allFiles.length}: ${describeDownloadableCandidate(
         file,
-        explicitDownloadUrl ?? sandboxDownloadUrl,
+        normalizeChatGptDownloadUrl(file.downloadUrl ?? file.url),
       )}`,
     );
   });
@@ -1617,6 +1723,7 @@ export async function collectChatGptFileArtifacts(params: {
     files: allFiles,
     sessionId: params.sessionId,
     logger: params.logger,
+    minTurnIndex: params.minTurnIndex,
   });
   const buttonSavedFiles =
     saved.failedFiles.length > 0
@@ -1654,7 +1761,7 @@ export async function collectChatGptFileArtifacts(params: {
 export const __test__ = {
   buildAssistantDownloadableFilesExpression,
   buildClickAssistantDownloadButtonsExpression,
-  downloadUrlFromSandboxUrl,
+  buildSandboxDownloadResolveExpression,
   normalizeChatGptDownloadUrl,
   normalizeSandboxPath,
   normalizeSandboxUrl,
