@@ -4,7 +4,7 @@ import fg from "fast-glob";
 import type { FileContent, FileSection, MinimalFsModule, FsStats } from "./types.js";
 import { FileValidationError } from "./errors.js";
 
-export const DEFAULT_MAX_FILE_SIZE_BYTES = 1 * 1024 * 1024; // 1 MB
+export const DEFAULT_MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024; // 20 MB
 const DEFAULT_FS = fs as MinimalFsModule;
 const DEFAULT_IGNORED_DIRS = new Set([
   "node_modules",

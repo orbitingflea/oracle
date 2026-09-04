@@ -320,6 +320,59 @@ describe("promptComposer", () => {
     expect(promptComposer.sendButtonTimeoutMs(["oracle-attach-verify.txt"], 120_000)).toBe(120_000);
   });
 
+  test("attachment send deadline grows with the bytes still uploading", () => {
+    const fiveMiB = { name: "dataset.bin", sizeBytes: 5 * 1024 * 1024 };
+    expect(promptComposer.sendButtonTimeoutMs([fiveMiB])).toBe(45_000 + 5 * 15_000);
+    expect(promptComposer.sendButtonTimeoutMs([fiveMiB], 120_000)).toBe(120_000 + 5 * 15_000);
+    expect(promptComposer.sendButtonTimeoutMs([fiveMiB, { name: "tiny.txt", sizeBytes: 10 }])).toBe(
+      45_000 + Math.ceil(((5 * 1024 * 1024 + 10) / (1024 * 1024)) * 15_000),
+    );
+    expect(promptComposer.sendButtonTimeoutMs([{ name: "unknown.bin" }])).toBe(45_000);
+  });
+
+  test("keeps waiting while Send stays disabled during an attachment upload", async () => {
+    vi.useFakeTimers();
+    try {
+      let sendPolls = 0;
+      const runtime = {
+        evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+          if (expression.includes("dispatchClickSequence")) {
+            sendPolls += 1;
+            // Upload accepted after ~60s: disabled until then, then clickable.
+            return sendPolls < 240
+              ? { result: { value: { status: "disabled" } } }
+              : { result: { value: { status: "point", x: 10, y: 20 } } };
+          }
+          return { result: { value: true } };
+        }),
+      } as unknown as { evaluate: (args: { expression: string }) => Promise<unknown> };
+      const input = { dispatchMouseEvent: vi.fn(async () => undefined) };
+
+      const promise = promptComposer.attemptSendButton(
+        runtime as never,
+        input as never,
+        undefined,
+        [{ name: "dataset.bin", sizeBytes: 5 * 1024 * 1024 }],
+      );
+      await vi.advanceTimersByTimeAsync(90_000);
+
+      await expect(promise).resolves.toBe(true);
+      expect(input.dispatchMouseEvent).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("a disabled Send without attachments still falls back to Enter", async () => {
+    const runtime = {
+      evaluate: vi.fn(async () => ({ result: { value: { status: "disabled" } } })),
+    };
+    await expect(
+      promptComposer.attemptSendButton(runtime as never, (() => undefined) as never),
+    ).resolves.toBe(false);
+    expect(runtime.evaluate).toHaveBeenCalledTimes(1);
+  });
+
   test("marks prompt submitted before commit verification finishes", async () => {
     const onPromptSubmitted = vi.fn();
     const runtime = {
