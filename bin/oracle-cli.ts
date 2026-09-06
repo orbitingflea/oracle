@@ -397,7 +397,7 @@ program
   )
   .option(
     "-f, --file <paths...>",
-    "Files/directories or glob patterns to attach (prefix with !pattern to exclude). Oversized files are rejected automatically (default cap: 1 MB; configurable via ORACLE_MAX_FILE_SIZE_BYTES or config.maxFileSizeBytes).",
+    "Files/directories or glob patterns to attach (prefix with !pattern to exclude). Oversized files are rejected automatically (default cap: 20 MB; configurable via ORACLE_MAX_FILE_SIZE_BYTES or config.maxFileSizeBytes).",
     collectPaths,
     [],
   )
@@ -678,7 +678,7 @@ program
   .addOption(
     new Option(
       "--browser-attachment-timeout <ms|s|m>",
-      "Maximum time to wait for attachment upload/readiness before clicking send (default 45s).",
+      "Base time to wait for attachment upload/readiness before clicking send (default 45s; each MiB of attachments adds 15s).",
     ).hideHelp(),
   )
   .addOption(

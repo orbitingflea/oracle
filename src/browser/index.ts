@@ -39,6 +39,7 @@ import {
   clearPromptComposer,
   waitForAssistantResponse,
   captureAssistantMarkdown,
+  attachmentUploadBudgetMs,
   clearComposerAttachments,
   uploadAttachmentFile,
   waitForAttachmentCompletion,
@@ -1600,6 +1601,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       const attachmentExpectations = submissionAttachments.map((a) => ({
         name: path.basename(a.path),
         generatedBundle: a.generatedBundle === true,
+        sizeBytes: a.sizeBytes,
       }));
       let inputOnlyAttachments = false;
       await raceWithDisconnect(clearPromptComposer(Runtime, logger));
@@ -1632,7 +1634,10 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         const perFileTimeout = 20_000;
         const waitBudget =
           Math.max(baseTimeout, 45_000) + (submissionAttachments.length - 1) * perFileTimeout;
-        const attachmentWaitBudget = Math.max(config.attachmentTimeoutMs ?? 0, waitBudget);
+        const attachmentWaitBudget = attachmentUploadBudgetMs(
+          Math.max(config.attachmentTimeoutMs ?? 0, waitBudget),
+          submissionAttachments,
+        );
         await waitForAttachmentCompletion(Runtime, attachmentWaitBudget, attachmentNames, logger);
         logger("All attachments uploaded");
       }
@@ -3190,6 +3195,7 @@ async function runRemoteBrowserMode(
       const attachmentExpectations = submissionAttachments.map((a) => ({
         name: path.basename(a.path),
         generatedBundle: a.generatedBundle === true,
+        sizeBytes: a.sizeBytes,
       }));
       await clearPromptComposer(Runtime, logger);
       await ensurePromptReady(Runtime, config.inputTimeoutMs, logger);
@@ -3209,7 +3215,10 @@ async function runRemoteBrowserMode(
         const perFileTimeout = 15_000;
         const waitBudget =
           Math.max(baseTimeout, 30_000) + (submissionAttachments.length - 1) * perFileTimeout;
-        const attachmentWaitBudget = Math.max(config.attachmentTimeoutMs ?? 0, waitBudget);
+        const attachmentWaitBudget = attachmentUploadBudgetMs(
+          Math.max(config.attachmentTimeoutMs ?? 0, waitBudget),
+          submissionAttachments,
+        );
         await waitForAttachmentCompletion(Runtime, attachmentWaitBudget, attachmentNames, logger);
         logger("All attachments uploaded");
       }

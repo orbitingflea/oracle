@@ -12,6 +12,20 @@ import {
   buildAttachmentEvidenceExpression,
 } from "./attachmentEvidence.js";
 
+// Allow more time for larger uploads while retaining the configured base timeout.
+const ATTACHMENT_UPLOAD_MS_PER_MIB = 15_000;
+
+export function attachmentUploadBudgetMs(
+  baseMs: number,
+  attachments: ReadonlyArray<string | { sizeBytes?: number }>,
+): number {
+  const totalBytes = attachments.reduce((total, attachment) => {
+    const size = typeof attachment === "object" ? attachment.sizeBytes : undefined;
+    return total + (typeof size === "number" && Number.isFinite(size) && size > 0 ? size : 0);
+  }, 0);
+  return baseMs + Math.ceil((totalBytes / (1024 * 1024)) * ATTACHMENT_UPLOAD_MS_PER_MIB);
+}
+
 export function buildAttachmentNamePattern(
   expectedName: string,
   allowStemOnly = false,

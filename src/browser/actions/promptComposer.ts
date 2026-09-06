@@ -13,7 +13,7 @@ import {
 } from "../conversationTurns.js";
 import { delay } from "../utils.js";
 import { logDomFailure } from "../domDebug.js";
-import { buildAttachmentNamePattern } from "./attachments.js";
+import { attachmentUploadBudgetMs, buildAttachmentNamePattern } from "./attachments.js";
 import { buildClickDispatcher } from "./domEvents.js";
 import { BrowserAutomationError } from "../../oracle/errors.js";
 import { buildAttachmentEvidenceExpression } from "./attachmentEvidence.js";
@@ -30,6 +30,7 @@ const ENTER_KEY_TEXT = "\r";
 export interface AttachmentReadyExpectation {
   name: string;
   generatedBundle?: boolean;
+  sizeBytes?: number;
 }
 
 type AttachmentReadyInput = string | AttachmentReadyExpectation;
@@ -580,8 +581,9 @@ async function attemptSendButton(
     for (const selector of selectors) {
       candidates.push(...Array.from(document.querySelectorAll(selector)));
     }
-    const button = candidates.find((node) => isVisible(node) && isEnabled(node)) || null;
-    if (!button) return { status: 'missing' };
+    const visibleButtons = candidates.filter(isVisible);
+    const button = visibleButtons.find(isEnabled) || null;
+    if (!button) return { status: visibleButtons.length > 0 ? 'disabled' : 'missing' };
     const rect = button.getBoundingClientRect();
     if (rect.width > 0 && rect.height > 0) {
       const x = rect.left + rect.width / 2;
@@ -628,7 +630,11 @@ async function attemptSendButton(
     }
     const { result } = await Runtime.evaluate({ expression: script, returnByValue: true });
     const value = result.value as
-      | { status?: "clicked" | "missing" | "point" | "settling"; x?: number; y?: number }
+      | {
+          status?: "clicked" | "disabled" | "missing" | "point" | "settling";
+          x?: number;
+          y?: number;
+        }
       | string
       | undefined;
     const status = typeof value === "string" ? value : value?.status;
@@ -654,7 +660,14 @@ async function attemptSendButton(
     if (status === "clicked") {
       return true;
     }
-    if (status === "missing") {
+    if (status === "disabled" && needAttachment) {
+      // ChatGPT keeps Send disabled until every upload is accepted; keep polling until the
+      // size-aware deadline instead of giving up on the first disabled sighting.
+      previousPoint = undefined;
+      await delay(250);
+      continue;
+    }
+    if (status === "missing" || status === "disabled") {
       break;
     }
     previousPoint = undefined;
@@ -726,9 +739,11 @@ function sendButtonTimeoutMs(
   if (!Array.isArray(attachmentNames) || attachmentNames.length === 0) {
     return 20_000;
   }
-  return typeof attachmentTimeoutMs === "number" && Number.isFinite(attachmentTimeoutMs)
-    ? Math.max(1_000, attachmentTimeoutMs)
-    : 45_000;
+  const baseMs =
+    typeof attachmentTimeoutMs === "number" && Number.isFinite(attachmentTimeoutMs)
+      ? Math.max(1_000, attachmentTimeoutMs)
+      : 45_000;
+  return attachmentUploadBudgetMs(baseMs, attachmentNames);
 }
 
 async function verifyPromptCommitted(

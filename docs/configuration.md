@@ -33,7 +33,7 @@ JSON5 parsing, so trailing commas and comments are allowed.
     debugPort: null, // fixed DevTools port (env: ORACLE_BROWSER_PORT / ORACLE_BROWSER_DEBUG_PORT)
     timeoutMs: 1200000,
     inputTimeoutMs: 30000,
-    attachmentTimeoutMs: 90000, // wait for file upload/readiness before clicking Send (default: 45s)
+    attachmentTimeoutMs: 90000, // base wait for file upload/readiness before clicking Send (default: 45s, plus 15s per MiB of attachments)
     cookieSync: false, // opt in to copying cookies from a live Chrome profile (prefer manualLogin)
     cookieSyncWaitMs: 0, // wait (ms) before retrying cookie sync when Chrome cookies are empty/locked
     assistantRecheckDelayMs: 0, // wait this long after timeout, then retry capture (0 = disabled)

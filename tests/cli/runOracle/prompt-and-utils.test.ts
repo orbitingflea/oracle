@@ -303,12 +303,12 @@ describe("oracle utility helpers", () => {
     }
   });
 
-  test("readFiles rejects files larger than 1 MB", async () => {
+  test("readFiles rejects files larger than 20 MB", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-readfiles-large-"));
     try {
       const largeFile = path.join(dir, "huge.bin");
-      await writeFile(largeFile, "a".repeat(1_200_000), "utf8");
-      await expect(readFiles([largeFile], { cwd: dir })).rejects.toThrow(/exceed the 1 MB limit/i);
+      await writeFile(largeFile, "a".repeat(21_000_000), "utf8");
+      await expect(readFiles([largeFile], { cwd: dir })).rejects.toThrow(/exceed the 20 MB limit/i);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -318,8 +318,8 @@ describe("oracle utility helpers", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "oracle-readfiles-large-override-"));
     try {
       const largeFile = path.join(dir, "huge.bin");
-      await writeFile(largeFile, "a".repeat(1_200_000), "utf8");
-      const files = await readFiles([largeFile], { cwd: dir, maxFileSizeBytes: 2_000_000 });
+      await writeFile(largeFile, "a".repeat(21_000_000), "utf8");
+      const files = await readFiles([largeFile], { cwd: dir, maxFileSizeBytes: 22_000_000 });
       expect(files).toHaveLength(1);
       expect(files[0].path).toBe(largeFile);
     } finally {

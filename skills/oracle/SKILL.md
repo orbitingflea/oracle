@@ -130,7 +130,7 @@ comma-separated entries.
 - Globs honor `.gitignore` and do not follow symlinks.
 - Dotfiles require an explicit dot-segment in the pattern, such as
   `--file ".github/**"`.
-- Files over 1 MB are rejected by default; configure
+- Files over 20 MB are rejected by default; configure
   `ORACLE_MAX_FILE_SIZE_BYTES` or `maxFileSizeBytes` when necessary.
 
 Keep total input under roughly 196k tokens. Use `--files-report` or
