@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { SessionMetadata } from "../../src/sessionStore.js";
 
 const baseMeta = {
@@ -241,5 +241,116 @@ describe("harvestSessionBrowserOutput recovery fallback", () => {
       }),
     ).rejects.toThrow(/explicit-ref/);
     expect(recoverConversationTab).not.toHaveBeenCalled();
+  });
+});
+
+describe("liveTailSessionBrowserOutput recovery fallback", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  test("recovers when the tab stops answering after the first poll", async () => {
+    const runningHarvest = {
+      ...completedHarvest,
+      state: "running",
+      stopExists: true,
+      sendExists: false,
+      lastAssistantMarkdown: "partial",
+      lastAssistantText: "partial",
+      lastAssistantSnippet: "partial",
+    };
+    const harvestChatGptTab = vi
+      .fn()
+      .mockResolvedValueOnce(runningHarvest) // initial probe
+      .mockResolvedValueOnce(runningHarvest) // first poll
+      .mockRejectedValueOnce(new Error("ChatGPT tab target-x did not respond within 10000ms"))
+      .mockResolvedValueOnce(completedHarvest); // recovered tab
+    const fakeChrome = { kill: vi.fn(), process: { unref: vi.fn() } };
+    const recoverConversationTab = vi.fn(async () => ({
+      host: "127.0.0.1",
+      port: 53555,
+      url: "https://chatgpt.com/c/saved-conversation",
+      ref: "recovered-target",
+      chrome: fakeChrome,
+    }));
+
+    vi.doMock("../../src/browser/liveTabs.js", () => ({
+      collectChatGptTabs: vi.fn(),
+      DEFAULT_REMOTE_CHROME_HOST: "127.0.0.1",
+      DEFAULT_REMOTE_CHROME_PORT: 9222,
+      extractConversationIdFromUrl: () => null,
+      formatBrowserTabState: () => "completed",
+      harvestChatGptTab,
+      sessionMatchesTab: () => false,
+    }));
+    vi.doMock("../../src/browser/recoverConversation.js", () => ({
+      recoverConversationTab,
+      isRecoveredConversationHarvestReady: () => true,
+    }));
+    vi.doMock("../../src/sessionStore.js", () => ({
+      sessionStore: { readSession: async () => baseMeta, updateSession: async () => {} },
+    }));
+
+    const { liveTailSessionBrowserOutput } = await import("../../src/cli/browserTabs.js");
+    const tail = liveTailSessionBrowserOutput("sess-recover", { writeOutputPath: "-" });
+    await vi.advanceTimersByTimeAsync(10_000);
+    const result = await tail;
+
+    expect(harvestChatGptTab).toHaveBeenCalledTimes(4);
+    expect(recoverConversationTab).toHaveBeenCalledTimes(1);
+    expect(recoverConversationTab).toHaveBeenCalledWith(baseMeta, expect.any(Function), {
+      existingEndpoint: { host: "127.0.0.1", port: 9223 },
+      waitForReady: false,
+    });
+    expect(harvestChatGptTab).toHaveBeenLastCalledWith(
+      expect.objectContaining({ host: "127.0.0.1", port: 53555, ref: "recovered-target" }),
+    );
+    expect(result.state).toBe("completed");
+    expect(fakeChrome.process.unref).toHaveBeenCalledTimes(1);
+  });
+
+  test("does not recover twice; a second failure surfaces the error", async () => {
+    const harvestChatGptTab = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("ChatGPT tab target-x did not respond within 10000ms"))
+      .mockRejectedValueOnce(
+        new Error("ChatGPT tab recovered-target did not respond within 10000ms"),
+      );
+    const recoverConversationTab = vi.fn(async () => ({
+      host: "127.0.0.1",
+      port: 53556,
+      url: "https://chatgpt.com/c/saved-conversation",
+      ref: "recovered-target",
+      chrome: null,
+    }));
+
+    vi.doMock("../../src/browser/liveTabs.js", () => ({
+      collectChatGptTabs: vi.fn(),
+      DEFAULT_REMOTE_CHROME_HOST: "127.0.0.1",
+      DEFAULT_REMOTE_CHROME_PORT: 9222,
+      extractConversationIdFromUrl: () => null,
+      formatBrowserTabState: () => "completed",
+      harvestChatGptTab,
+      sessionMatchesTab: () => false,
+    }));
+    vi.doMock("../../src/browser/recoverConversation.js", () => ({
+      recoverConversationTab,
+      isRecoveredConversationHarvestReady: () => true,
+    }));
+    vi.doMock("../../src/sessionStore.js", () => ({
+      sessionStore: { readSession: async () => baseMeta, updateSession: async () => {} },
+    }));
+
+    const { liveTailSessionBrowserOutput } = await import("../../src/cli/browserTabs.js");
+    await expect(liveTailSessionBrowserOutput("sess-recover")).rejects.toThrow(
+      /recovered-target did not respond/,
+    );
+    expect(recoverConversationTab).toHaveBeenCalledTimes(1);
+    expect(harvestChatGptTab).toHaveBeenCalledTimes(2);
   });
 });

@@ -12,10 +12,17 @@ import {
 import { captureAssistantMarkdown, readAssistantSnapshot } from "./actions/assistantResponse.js";
 import { buildConversationTurnListExpression } from "./conversationTurns.js";
 import { extractStableConversationIdFromUrl } from "./conversationUrl.js";
+import { withTimeout } from "./reattachHelpers.js";
 import { delay } from "./utils.js";
 
 export const DEFAULT_REMOTE_CHROME_HOST = "127.0.0.1";
 export const DEFAULT_REMOTE_CHROME_PORT = 9222;
+/**
+ * Upper bound for one round of CDP traffic with a single tab (connect, enable, evaluate).
+ * A tab whose renderer is frozen accepts the socket but never answers; without this bound
+ * every caller that walks the tab list hangs forever.
+ */
+export const TAB_RESPONSE_TIMEOUT_MS = 10_000;
 
 const LOGIN_CTA_PATTERN =
   /\b(log in|login|sign up|sign in|continue with google|continue with microsoft)\b/i;
@@ -302,6 +309,33 @@ async function connectToTarget(host: string, port: number, targetId: string) {
   return client;
 }
 
+// Keep the raw connection separate from domain setup so a hung enable can still be closed.
+async function withTabRuntime<T>(
+  host: string,
+  port: number,
+  targetId: string,
+  task: (Runtime: Awaited<ReturnType<typeof CDP>>["Runtime"]) => Promise<T>,
+): Promise<T> {
+  const connection = CDP({ host, port, target: targetId });
+  let finished = false;
+  try {
+    return await withTimeout(
+      connection.then(async (client) => {
+        if (finished) throw new Error("Tab inspection already timed out");
+        await client.Runtime?.enable?.();
+        await client.DOM?.enable?.();
+        return task(client.Runtime);
+      }),
+      TAB_RESPONSE_TIMEOUT_MS,
+      `ChatGPT tab ${targetId} did not respond within ${TAB_RESPONSE_TIMEOUT_MS}ms`,
+    );
+  } finally {
+    finished = true;
+    // Cleanup must not delay the result; late connections are closed as soon as they arrive.
+    void connection.then((client) => client.close()).catch(() => undefined);
+  }
+}
+
 export async function inspectChatGptTab(
   options: InspectChatGptTabOptions,
 ): Promise<ChatGptTabSummary> {
@@ -312,9 +346,7 @@ export async function inspectChatGptTab(
     throw new Error("inspectChatGptTab requires a target with targetId.");
   }
 
-  const client = await connectToTarget(host, port, targetId);
-  try {
-    const { Runtime } = client;
+  return withTabRuntime(host, port, targetId, async (Runtime) => {
     const evaluation = await Runtime.evaluate({
       expression: buildTabInspectionExpression(),
       returnByValue: true,
@@ -400,9 +432,7 @@ export async function inspectChatGptTab(
     summary.state = classifyTabState(summary);
     summary.fingerprint = buildTargetFingerprint(summary);
     return summary;
-  } finally {
-    await client.close().catch(() => undefined);
-  }
+  });
 }
 
 export function classifyTabState(
@@ -536,9 +566,7 @@ export async function harvestChatGptTab(
   const resolved = options.target
     ? await inspectChatGptTab({ host, port, target: options.target })
     : await resolveChatGptTab({ host, port, ref: options.ref });
-  const client = await connectToTarget(host, port, resolved.targetId);
-  try {
-    const { Runtime } = client;
+  const harvested = await withTabRuntime(host, port, resolved.targetId, async (Runtime) => {
     const snapshot = await readAssistantSnapshot(Runtime).catch(() => null);
     const nowSummary = await inspectChatGptTab({
       host,
@@ -576,7 +604,7 @@ export async function harvestChatGptTab(
       snapshot.text.trim().length > 0
         ? snapshot.text.trim()
         : nowSummary.lastAssistantText;
-    const harvested: ChatGptTabSummary = {
+    const summary: ChatGptTabSummary = {
       ...nowSummary,
       lastAssistantText,
       lastAssistantSnippet: trimToSnippet(lastAssistantText),
@@ -590,45 +618,44 @@ export async function harvestChatGptTab(
           ? snapshot.turnId
           : nowSummary.lastAssistantTurnId,
     };
-    if (harvested.stopExists && options.stallWindowMs && options.stallWindowMs > 0) {
-      const firstFingerprint = harvested.fingerprint;
-      await delay(options.stallWindowMs);
-      const followup = await inspectChatGptTab({
-        host,
-        port,
-        target: {
-          targetId: harvested.targetId,
-          title: harvested.title,
-          url: harvested.url,
-          type: "page",
-        },
-      });
-      harvested.stopExists = followup.stopExists;
-      harvested.sendExists = followup.sendExists;
-      harvested.promptReady = followup.promptReady;
-      harvested.currentModelLabel = followup.currentModelLabel;
-      harvested.focused = followup.focused;
-      harvested.visibilityState = followup.visibilityState;
-      harvested.assistantCount = followup.assistantCount;
-      harvested.authenticated = followup.authenticated;
-      harvested.loginButtonExists = followup.loginButtonExists;
-      harvested.lastUserText = followup.lastUserText;
-      harvested.lastUserSnippet = followup.lastUserSnippet;
-      harvested.assistantFollowsLatestUser = followup.assistantFollowsLatestUser;
-      harvested.lastAssistantTurnIndex = followup.lastAssistantTurnIndex;
-      harvested.lastUserTurnIndex = followup.lastUserTurnIndex;
-      harvested.fingerprint = followup.fingerprint;
-      harvested.state =
-        harvested.stopExists && firstFingerprint === followup.fingerprint
-          ? "stalled"
-          : classifyTabState(harvested);
-    } else {
-      harvested.state = classifyTabState(harvested);
-    }
-    return harvested;
-  } finally {
-    await client.close().catch(() => undefined);
+    return summary;
+  });
+  if (harvested.stopExists && options.stallWindowMs && options.stallWindowMs > 0) {
+    const firstFingerprint = harvested.fingerprint;
+    await delay(options.stallWindowMs);
+    const followup = await inspectChatGptTab({
+      host,
+      port,
+      target: {
+        targetId: harvested.targetId,
+        title: harvested.title,
+        url: harvested.url,
+        type: "page",
+      },
+    });
+    harvested.stopExists = followup.stopExists;
+    harvested.sendExists = followup.sendExists;
+    harvested.promptReady = followup.promptReady;
+    harvested.currentModelLabel = followup.currentModelLabel;
+    harvested.focused = followup.focused;
+    harvested.visibilityState = followup.visibilityState;
+    harvested.assistantCount = followup.assistantCount;
+    harvested.authenticated = followup.authenticated;
+    harvested.loginButtonExists = followup.loginButtonExists;
+    harvested.lastUserText = followup.lastUserText;
+    harvested.lastUserSnippet = followup.lastUserSnippet;
+    harvested.assistantFollowsLatestUser = followup.assistantFollowsLatestUser;
+    harvested.lastAssistantTurnIndex = followup.lastAssistantTurnIndex;
+    harvested.lastUserTurnIndex = followup.lastUserTurnIndex;
+    harvested.fingerprint = followup.fingerprint;
+    harvested.state =
+      harvested.stopExists && firstFingerprint === followup.fingerprint
+        ? "stalled"
+        : classifyTabState(harvested);
+  } else {
+    harvested.state = classifyTabState(harvested);
   }
+  return harvested;
 }
 
 export function extractConversationIdFromUrl(url: string): string | undefined {
