@@ -91,7 +91,7 @@ See [OpenAI / Azure / OpenRouter](openai-endpoints.md) and [OpenRouter](openrout
 | `--browser-follow-up <prompt>`                                                 | Multi-turn in the same ChatGPT conversation.                                                                                 |
 | `--browser-port <port>`                                                        | Pin Chrome DevTools port.                                                                                                    |
 | `--browser-inline-cookies[(-file)] <…>`                                        | Supply cookies inline (no Keychain / Chrome).                                                                                |
-| `--browser-timeout`, `--browser-input-timeout`, `--browser-attachment-timeout` | Overall / input / attachment readiness timeouts (h/m/s/ms).                                                                  |
+| `--browser-timeout`, `--browser-input-timeout`, `--browser-attachment-timeout` | Response inactivity / input / attachment readiness timeouts (h/m/s/ms).                                                      |
 | `--browser-recheck-delay`, `--browser-recheck-timeout`                         | Delayed retry after a timeout.                                                                                               |
 | `--browser-auto-reattach-delay/-interval/-timeout`                             | Poll the existing tab when ChatGPT redirects mid-load.                                                                       |
 | `--browser-reuse-wait`                                                         | Wait for shared Chrome profile before launching.                                                                             |

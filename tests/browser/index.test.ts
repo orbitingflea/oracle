@@ -533,11 +533,12 @@ describe("ChatGPT UI warning detection", () => {
         }),
       };
 
+      const reloadLogger = vi.fn();
       const promise = __test__.waitForAssistantResponseWithReload(
         Runtime as never,
         Page as never,
         3_000,
-        vi.fn() as never,
+        reloadLogger as never,
         undefined,
         "synthetic-recovery",
       );
@@ -545,6 +546,10 @@ describe("ChatGPT UI warning detection", () => {
 
       await expect(promise).resolves.toMatchObject({ text: complete.text });
       expect(Page.navigate).toHaveBeenCalledOnce();
+      // Prefixed so the non-verbose session log shows the reload instead of an apparent hang.
+      expect(reloadLogger).toHaveBeenCalledWith(
+        "[browser] Assistant response stalled; reloading conversation and retrying once",
+      );
       expect(responseProbeHydrationStates).toEqual([false, true]);
     } finally {
       vi.useRealTimers();

@@ -3,6 +3,7 @@ import type { RunOracleOptions } from "../../src/oracle.js";
 import type { BrowserSessionConfig } from "../../src/sessionStore.js";
 import {
   buildBrowserRunWarningsForTest,
+  formatBrowserWaitBudgetLine,
   runBrowserSessionExecution,
 } from "../../src/browser/sessionRunner.js";
 
@@ -14,6 +15,32 @@ const baseRunOptions: RunOracleOptions = {
 };
 
 const baseConfig: BrowserSessionConfig = {};
+
+describe("formatBrowserWaitBudgetLine", () => {
+  test("describes the default inactivity budget and active-wait ceiling", () => {
+    expect(formatBrowserWaitBudgetLine({})).toBe(
+      "This run may take a while: Oracle keeps waiting while ChatGPT is visibly working (up to 3h 0m) and gives up after 20m 0s without visible progress.",
+    );
+  });
+
+  test("reflects a custom --browser-timeout, including one above the ceiling", () => {
+    expect(formatBrowserWaitBudgetLine({ timeoutMs: 600_000 })).toBe(
+      "This run may take a while: Oracle keeps waiting while ChatGPT is visibly working (up to 3h 0m) and gives up after 10m 0s without visible progress.",
+    );
+    expect(formatBrowserWaitBudgetLine({ timeoutMs: 5 * 60 * 60 * 1000 })).toBe(
+      "This run may take a while: Oracle keeps waiting while ChatGPT is visibly working (up to 5h 0m) and gives up after 5h 0m without visible progress.",
+    );
+  });
+
+  test("states the Deep Research hard cap for the effective timeout", () => {
+    expect(formatBrowserWaitBudgetLine({ researchMode: "deep" })).toBe(
+      "Deep Research runs are given up on after 40m 0s.",
+    );
+    expect(formatBrowserWaitBudgetLine({ researchMode: "deep", timeoutMs: 3_600_000 })).toBe(
+      "Deep Research runs are given up on after 1h 0m.",
+    );
+  });
+});
 
 describe("runBrowserSessionExecution", () => {
   test("bounds browser prompt preparation with the configured input timeout", async () => {
@@ -489,6 +516,9 @@ describe("runBrowserSessionExecution", () => {
         }),
         executeBrowser: async ({ log: automationLog }) => {
           automationLog?.("Prompt textarea ready");
+          automationLog?.(
+            "[browser] Assistant response stalled; reloading conversation and retrying once",
+          );
           noisyLogger();
           return {
             answerText: "text",
@@ -505,6 +535,10 @@ describe("runBrowserSessionExecution", () => {
     );
     expect(log.mock.calls.some((call) => /Prompt textarea ready/.test(String(call[0])))).toBe(
       false,
+    );
+    // A mid-run reload must stay visible without --verbose.
+    expect(log.mock.calls.some((call) => /Assistant response stalled/.test(String(call[0])))).toBe(
+      true,
     );
     expect(noisyLogger).toHaveBeenCalled(); // ensure executeBrowser ran
   });

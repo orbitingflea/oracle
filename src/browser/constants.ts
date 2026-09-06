@@ -101,5 +101,9 @@ export const DEEP_RESEARCH_PILL_LABEL = "Deep research";
 export const DEEP_RESEARCH_POLL_INTERVAL_MS = 5_000;
 export const DEEP_RESEARCH_AUTO_CONFIRM_WAIT_MS = 70_000;
 export const DEEP_RESEARCH_DEFAULT_TIMEOUT_MS = 2_400_000;
+// Hard ceiling on a single assistant wait while ChatGPT still shows active generation (Stop
+// control, thinking indicator, live progress). Protects against a stuck spinner; the configured
+// browser timeout wins when it is longer.
+export const ASSISTANT_ACTIVE_WAIT_CEILING_MS = 3 * 60 * 60 * 1000;
 export const FINISHED_ACTIONS_SELECTOR =
   'button[data-testid="copy-turn-action-button"], button[data-testid="good-response-turn-action-button"], button[data-testid="bad-response-turn-action-button"], button[aria-label="Share"]';

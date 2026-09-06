@@ -1,6 +1,7 @@
 import type { ChromeClient, BrowserLogger } from "../types.js";
 import {
   ANSWER_SELECTORS,
+  ASSISTANT_ACTIVE_WAIT_CEILING_MS,
   ASSISTANT_ROLE_SELECTOR,
   CONVERSATION_TURN_SELECTOR,
   COPY_BUTTON_SELECTOR,
@@ -25,6 +26,14 @@ const MIN_CONFIDENT_ANSWER_LENGTH = 16;
 function readPositiveIntEnv(name: string, fallback: number): number {
   const raw = Number(process.env[name]);
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : fallback;
+}
+
+// The browser timeout is an inactivity budget: the wait fails only once `timeoutMs` passes with
+// no visible generation (the same strong liveness evidence the terminal gate uses). While
+// ChatGPT is visibly working the deadline keeps sliding, up to this hard ceiling so a stuck
+// spinner cannot hang a run forever. A longer configured timeout raises the ceiling with it.
+export function resolveAssistantWaitCeilingMs(timeoutMs: number): number {
+  return Math.max(timeoutMs, ASSISTANT_ACTIVE_WAIT_CEILING_MS);
 }
 
 // Terminal-completion gate. A turn is finalized only on POSITIVE proof it is done — never on
@@ -239,12 +248,17 @@ export async function waitForAssistantResponse(
   meta: { turnId?: string | null; messageId?: string | null };
 }> {
   const start = Date.now();
+  // Wall-clock cap for this whole wait. `timeoutMs` itself is spent only on inactivity (see
+  // pollAssistantCompletion); the in-page observer only needs the outer ceiling because the
+  // node-side poller is the one that decides when the answer has stalled.
+  const hardDeadline = start + resolveAssistantWaitCeilingMs(timeoutMs);
+  const remainingCeilingMs = () => Math.max(0, hardDeadline - Date.now());
   logger("Waiting for ChatGPT response");
   // Learned: two paths are needed:
   // 1) DOM observer (fast when mutations fire),
   // 2) snapshot poller (fallback when observers miss or JS stalls).
   const expression = buildResponseObserverExpression(
-    timeoutMs,
+    remainingCeilingMs(),
     minTurnIndex,
     expectedConversationId,
   );
@@ -268,6 +282,7 @@ export async function waitForAssistantResponse(
     minTurnIndex,
     expectedConversationId,
     pollerAbort.signal,
+    hardDeadline,
   ).then(
     (value) => ({ kind: "poll" as const, value }),
     (error) => {
@@ -309,12 +324,16 @@ export async function waitForAssistantResponse(
       } else if (source === "poll") {
         throw error;
       } else if (source === "evaluation") {
+        // Nothing reads the poller from here on; stop it so it cannot keep polling the page
+        // (for up to the active-wait ceiling) after this wait has been abandoned.
+        pollerAbort.abort();
         const recovered = await recoverAssistantResponse(
           Runtime,
           timeoutMs,
           logger,
           minTurnIndex,
           expectedConversationId,
+          hardDeadline,
         );
         if (recovered) {
           return recovered;
@@ -334,7 +353,7 @@ export async function waitForAssistantResponse(
 
   const parsed = await parseAssistantEvaluationResult(Runtime, evaluation, logger);
   if (!parsed) {
-    let remainingMs = Math.max(0, timeoutMs - (Date.now() - start));
+    let remainingMs = Math.min(timeoutMs, remainingCeilingMs());
     if (remainingMs > 0) {
       const recovered = await recoverAssistantResponse(
         Runtime,
@@ -342,11 +361,12 @@ export async function waitForAssistantResponse(
         logger,
         minTurnIndex,
         expectedConversationId,
+        hardDeadline,
       );
       if (recovered) {
         return recovered;
       }
-      remainingMs = Math.max(0, timeoutMs - (Date.now() - start));
+      remainingMs = Math.min(timeoutMs, remainingCeilingMs());
       if (remainingMs > 0) {
         const polled = await Promise.race([
           pollerPromise.catch(() => null),
@@ -380,15 +400,17 @@ export async function waitForAssistantResponse(
   // active thinking). We deliberately drop the old ">= candidate length" acceptance: the
   // poller is turn-scoped (minTurnIndex), so whatever it proves terminal is the right turn,
   // even when the real answer is shorter than a verbose preamble.
-  const elapsedMs = Date.now() - start;
-  const remainingMs = Math.max(0, timeoutMs - elapsedMs);
-  if (remainingMs > 0) {
+  if (remainingCeilingMs() > 0) {
     logger("Confirming the capture is terminal (not a mid-stream/preamble capture)");
+    // Confirmation gets the full inactivity budget again: a captured preamble is often followed
+    // by a long, visibly active reasoning phase, and the shared hard deadline still applies.
     const completed = await pollAssistantCompletion(
       Runtime,
-      remainingMs,
+      timeoutMs,
       minTurnIndex,
       expectedConversationId,
+      undefined,
+      hardDeadline,
     );
     if (completed) {
       return completed;
@@ -499,52 +521,26 @@ async function recoverAssistantResponse(
   logger: BrowserLogger,
   minTurnIndex?: number,
   expectedConversationId?: string,
+  hardDeadline?: number,
 ): Promise<{
   text: string;
   html?: string;
   meta: { turnId?: string | null; messageId?: string | null };
 } | null> {
-  const recoveryTimeoutMs = Math.max(0, timeoutMs);
-  if (recoveryTimeoutMs === 0) {
-    return null;
-  }
-  const recoveryStartedAt = Date.now();
-  const recovered = await waitForCondition(
-    async () => {
-      const snapshot = await readAssistantSnapshot(Runtime, minTurnIndex, expectedConversationId);
-      return normalizeAssistantSnapshot(snapshot);
-    },
-    recoveryTimeoutMs,
-    400,
+  const recovered = await pollAssistantCompletion(
+    Runtime,
+    timeoutMs,
+    minTurnIndex,
+    expectedConversationId,
+    undefined,
+    hardDeadline,
   );
   if (recovered) {
-    // Route EVERY recovered snapshot through the terminal-only poller (not just short ones):
-    // a recovered long preamble is exactly the raw-return bug this gate exists to prevent.
-    logger("Recovered a candidate response; confirming it is terminal before finalizing");
-    const remainingMs = Math.max(0, recoveryTimeoutMs - (Date.now() - recoveryStartedAt));
-    if (remainingMs > 0) {
-      const confirmed = await pollAssistantCompletion(
-        Runtime,
-        remainingMs,
-        minTurnIndex,
-        expectedConversationId,
-      );
-      if (confirmed) {
-        logger("Recovered and confirmed assistant response via polling fallback");
-        return confirmed;
-      }
-      // Unconfirmable within budget: refuse (return null) so the caller fails fast instead
-      // of finalizing a possibly-incomplete recovered capture.
-      await logConversationSnapshot(Runtime, logger).catch(() => undefined);
-      return null;
-    }
-    // No confirmation time left: refuse rather than return the unconfirmed recovered snapshot
-    // (returning it raw would reopen the recovered-long-preamble leak this gate closes).
+    logger("Recovered and confirmed assistant response via polling fallback");
+  } else {
     await logConversationSnapshot(Runtime, logger).catch(() => undefined);
-    return null;
   }
-  await logConversationSnapshot(Runtime, logger).catch(() => undefined);
-  return null;
+  return recovered;
 }
 
 async function parseAssistantEvaluationResult(
@@ -667,26 +663,35 @@ async function terminateRuntimeExecution(Runtime: ChromeClient["Runtime"]): Prom
   }
 }
 
+// `inactivityTimeoutMs` is spent only while the page shows no active generation; each cycle
+// that observes the Stop control or strong thinking activity pushes the deadline forward.
+// `hardDeadline` (absolute) caps the wait regardless, so a stuck spinner still fails eventually.
 async function pollAssistantCompletion(
   Runtime: ChromeClient["Runtime"],
-  timeoutMs: number,
+  inactivityTimeoutMs: number,
   minTurnIndex?: number,
   expectedConversationId?: string,
   abortSignal?: AbortSignal,
+  hardDeadline: number = Date.now() + resolveAssistantWaitCeilingMs(inactivityTimeoutMs),
 ): Promise<{
   text: string;
   html?: string;
   meta: { turnId?: string | null; messageId?: string | null };
 } | null> {
-  const watchdogDeadline = Date.now() + timeoutMs;
+  let lastActivityAt = Date.now();
   let gate = createTerminalGateState(Date.now());
-  while (Date.now() < watchdogDeadline) {
+  while (true) {
+    const now = Date.now();
+    if (now >= hardDeadline || now - lastActivityAt >= inactivityTimeoutMs) {
+      return null;
+    }
     // Check abort signal to stop polling when another path won the race
     if (abortSignal?.aborted) {
       return null;
     }
     const snapshot = await readAssistantSnapshot(Runtime, minTurnIndex, expectedConversationId);
     const normalized = normalizeAssistantSnapshot(snapshot);
+    let generationActive = false;
     if (normalized) {
       // Generated-image answers stream no text and mount no action bar; accept immediately.
       if (isGeneratedImageAssistantAnswer(normalized)) {
@@ -715,15 +720,23 @@ async function pollAssistantCompletion(
       if (decision.terminal) {
         return normalized;
       }
+      generationActive = stopVisible || thinkingActivity.strong;
     } else {
       // The turn disappeared/reset (navigation, re-render): restart the gate so a stale
       // action-bar debounce cannot carry over onto a fresh turn.
       gate = createTerminalGateState(Date.now());
+      // No answer text yet is the normal shape of a long Pro thinking phase: keep waiting as
+      // long as the page proves the model is still working.
+      generationActive = (await readThinkingActivity(Runtime)).strong;
+    }
+    if (generationActive) {
+      lastActivityAt = Date.now();
     }
     await delay(400);
   }
-  return null;
 }
+
+export const pollAssistantCompletionForTest = pollAssistantCompletion;
 
 async function isStopButtonVisible(Runtime: ChromeClient["Runtime"]): Promise<boolean> {
   try {
@@ -890,22 +903,6 @@ function normalizeAssistantSnapshot(snapshot: AssistantSnapshot | null): {
 
 function isGeneratedImageAssistantAnswer(answer: { html?: string } | null): boolean {
   return Boolean(answer?.html?.includes("/backend-api/estuary/content?id=file_"));
-}
-
-async function waitForCondition<T>(
-  getter: () => Promise<T | null>,
-  timeoutMs: number,
-  pollIntervalMs = 400,
-): Promise<T | null> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const value = await getter();
-    if (value) {
-      return value;
-    }
-    await delay(pollIntervalMs);
-  }
-  return null;
 }
 
 function buildAssistantSnapshotExpression(
