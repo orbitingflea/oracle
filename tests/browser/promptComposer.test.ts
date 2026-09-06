@@ -8,7 +8,9 @@ import {
 import {
   CONVERSATION_TURN_CONTAINER_SELECTOR,
   CONVERSATION_TURN_SELECTOR,
+  SEND_BUTTON_SELECTORS,
 } from "../../src/browser/constants.js";
+import { BrowserAutomationError } from "../../src/oracle/errors.js";
 
 const evaluateAttachmentReady = (expectedName: string, visibleName: string): boolean => {
   class FakeElement {
@@ -69,6 +71,86 @@ const evaluateAttachmentReady = (expectedName: string, visibleName: string): boo
     `return ${expression};`,
   );
   return Boolean(evaluate(document, FakeElement, FakeInputElement));
+};
+
+// Runs the real injected send scripts against a minimal DOM so the trusted-click
+// marker is exercised as written rather than stubbed by the evaluate mock.
+const createSendButtonDom = () => {
+  class FakeElement {
+    readonly handlers: ((event: { isTrusted: boolean; target: unknown }) => void)[] = [];
+
+    constructor(readonly top: number) {}
+
+    addEventListener(
+      type: string,
+      handler: (event: { isTrusted: boolean; target: unknown }) => void,
+    ) {
+      if (type === "click") this.handlers.push(handler);
+    }
+
+    getBoundingClientRect() {
+      return { left: 10, top: this.top, width: 20, height: 10 };
+    }
+
+    getAttribute() {
+      return null;
+    }
+
+    hasAttribute() {
+      return false;
+    }
+
+    closest(selector: string) {
+      return selector === SEND_BUTTON_SELECTORS.join(",") ? this : null;
+    }
+
+    contains(node: unknown) {
+      return node === this;
+    }
+  }
+
+  let button = new FakeElement(20);
+  const listeners: ((event: { isTrusted: boolean; target: unknown }) => void)[] = [];
+  const windowStub: Record<string, unknown> = {
+    innerWidth: 800,
+    innerHeight: 600,
+    getComputedStyle: () => ({ display: "block", visibility: "visible", pointerEvents: "auto" }),
+  };
+  const document = {
+    querySelector: () => null,
+    querySelectorAll: (selector: string) =>
+      selector === SEND_BUTTON_SELECTORS[0] ? [button] : ([] as unknown[]),
+    elementFromPoint: () => button,
+    addEventListener: (
+      type: string,
+      handler: (event: { isTrusted: boolean; target: unknown }) => void,
+    ) => {
+      if (type === "click") listeners.push(handler);
+    },
+  };
+
+  return {
+    run: (expression: string) =>
+      new Function(
+        "document",
+        "window",
+        "HTMLElement",
+        "HTMLTextAreaElement",
+        "HTMLInputElement",
+        `return ${expression};`,
+      )(document, windowStub, FakeElement, class {}, class {}),
+    replaceButton: () => {
+      button = new FakeElement(20);
+    },
+    dispatchTrustedClick: () => {
+      // Only listeners on the document or on the node actually clicked can see
+      // this event; one left on a detached node cannot.
+      for (const handler of [...listeners, ...button.handlers]) {
+        handler({ isTrusted: true, target: button });
+      }
+    },
+    listenerCount: () => listeners.length,
+  };
 };
 
 describe("promptComposer", () => {
@@ -290,7 +372,7 @@ describe("promptComposer", () => {
     try {
       const runtime = {
         evaluate: vi.fn(async ({ expression }: { expression: string }) => {
-          if (expression.includes("dispatchClickSequence")) {
+          if (expression.includes("button.scrollIntoView")) {
             return { result: { value: { status: "disabled" } } };
           }
           return { result: { value: true } };
@@ -336,7 +418,7 @@ describe("promptComposer", () => {
           };
         }
         if (expression.includes("button.scrollIntoView")) {
-          return { result: { value: { status: "clicked" } } };
+          return { result: { value: { status: "point", x: 10, y: 20 } } };
         }
         return {
           result: {
@@ -356,7 +438,7 @@ describe("promptComposer", () => {
         };
       }),
     };
-    const input = { insertText: vi.fn(), dispatchKeyEvent: vi.fn() };
+    const input = { insertText: vi.fn(), dispatchKeyEvent: vi.fn(), dispatchMouseEvent: vi.fn() };
     const logger = Object.assign(vi.fn(), { verbose: false });
 
     await submitPrompt(
@@ -548,7 +630,13 @@ describe("promptComposer", () => {
       await vi.advanceTimersByTimeAsync(1_250);
 
       await expect(result).resolves.toBe(true);
-      expect(evaluate).toHaveBeenCalledTimes(2);
+      // Two measurements (the stability samples) and one post-click
+      // verification probe: a third measurement would mean a second click.
+      const measurements = evaluate.mock.calls.filter(
+        (args) => !String((args[0] as { expression: string }).expression).includes("clickSeen"),
+      );
+      expect(measurements).toHaveLength(2);
+      expect(evaluate).toHaveBeenCalledTimes(3);
       expect(input.dispatchMouseEvent).toHaveBeenCalledTimes(3);
     } finally {
       vi.useRealTimers();
@@ -602,6 +690,8 @@ describe("promptComposer", () => {
         "mouseMoved",
         "mousePressed",
         "mouseReleased",
+        // Post-click verification probe; it confirms the click and stops there.
+        "measurePoint",
       ]);
       expect(page.bringToFront).toHaveBeenCalledTimes(1);
       expect(input.dispatchMouseEvent).toHaveBeenNthCalledWith(1, {
@@ -637,6 +727,381 @@ describe("promptComposer", () => {
         button: "left",
         clickCount: 1,
       });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  test("re-clicks with fresh coordinates after a proven missed send click", async () => {
+    vi.useFakeTimers();
+    try {
+      let clicksCompleted = 0;
+      const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("button.scrollIntoView")) {
+          // The button drifts down a pixel after the first (missed) click.
+          return {
+            result: {
+              value: {
+                status: "point",
+                x: 10,
+                y: 20 + clicksCompleted,
+                state: { composerCleared: false, stopVisible: false, turnsCount: 0 },
+              },
+            },
+          };
+        }
+        if (expression.includes("clickSeen")) {
+          // First click is eaten by a mid-click layout shift; the second lands.
+          return {
+            result: {
+              value: {
+                composerCleared: clicksCompleted >= 2,
+                stopVisible: false,
+                turnsCount: 0,
+                clickSeen: false,
+              },
+            },
+          };
+        }
+        return { result: { value: 0 } };
+      });
+      const input = {
+        dispatchMouseEvent: vi.fn(async ({ type }: { type: string }) => {
+          if (type === "mouseReleased") clicksCompleted += 1;
+        }),
+      };
+
+      const page = { bringToFront: vi.fn(async () => undefined) };
+
+      const result = promptComposer.attemptSendButton(
+        { evaluate } as never,
+        input as never,
+        undefined,
+        undefined,
+        undefined,
+        page as never,
+      );
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      await expect(result).resolves.toBe(true);
+      expect(input.dispatchMouseEvent).toHaveBeenCalledTimes(6);
+      // A miss can mean the window lost focus, so the retry re-activates the
+      // target instead of trusting the activation that preceded the miss.
+      expect(page.bringToFront).toHaveBeenCalledTimes(2);
+      // The retry re-measures and only clicks once the fresh point is stable.
+      const ys = input.dispatchMouseEvent.mock.calls.map(
+        ([event]) => (event as unknown as { y: number }).y,
+      );
+      expect(ys.slice(0, 3)).toEqual([20, 20, 20]);
+      expect(ys.slice(3)).toEqual([21, 21, 21]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("does not count a stop control that was already visible as send proof", async () => {
+    vi.useFakeTimers();
+    try {
+      const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("button.scrollIntoView")) {
+          return {
+            result: {
+              value: {
+                status: "point",
+                x: 10,
+                y: 20,
+                state: { composerCleared: false, stopVisible: true, turnsCount: 3 },
+              },
+            },
+          };
+        }
+        if (expression.includes("clickSeen")) {
+          // A response from the resumed conversation is still streaming: the
+          // stop control and the turn count were already there before the click.
+          return {
+            result: {
+              value: {
+                composerCleared: false,
+                stopVisible: true,
+                turnsCount: 3,
+                clickSeen: false,
+              },
+            },
+          };
+        }
+        return { result: { value: 0 } };
+      });
+      const input = { dispatchMouseEvent: vi.fn(async () => undefined) };
+
+      const result = promptComposer.attemptSendButton({ evaluate } as never, input as never);
+      const assertion = expect(result).resolves.toBe(false);
+      await vi.advanceTimersByTimeAsync(15_000);
+
+      await assertion;
+      expect(input.dispatchMouseEvent).toHaveBeenCalledTimes(12);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("throws a structured error after four proven attachment send misses", async () => {
+    vi.useFakeTimers();
+    try {
+      const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("button.scrollIntoView")) {
+          return {
+            result: {
+              value: {
+                status: "point",
+                x: 10,
+                y: 20,
+                state: { composerCleared: false, stopVisible: false, turnsCount: 3 },
+              },
+            },
+          };
+        }
+        if (expression.includes("clickSeen")) {
+          return {
+            result: {
+              value: {
+                composerCleared: false,
+                stopVisible: false,
+                turnsCount: 3,
+                clickSeen: false,
+              },
+            },
+          };
+        }
+        if (expression.includes("chipsReady")) {
+          return { result: { value: true } };
+        }
+        return { result: { value: 0 } };
+      });
+      const input = { dispatchMouseEvent: vi.fn(async () => undefined) };
+
+      const result = promptComposer.attemptSendButton(
+        { evaluate } as never,
+        input as never,
+        undefined,
+        ["oracle-attach-verify.txt"],
+        30_000,
+      );
+      const assertion = result.then(
+        () => {
+          throw new Error("expected attemptSendButton to reject");
+        },
+        (error: unknown) => error,
+      );
+      await vi.advanceTimersByTimeAsync(15_000);
+
+      const error = await assertion;
+      expect(error).toBeInstanceOf(BrowserAutomationError);
+      expect((error as BrowserAutomationError).details).toMatchObject({
+        code: "send-click-missed",
+        clickAttempts: 4,
+      });
+      expect(input.dispatchMouseEvent).toHaveBeenCalledTimes(12);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("re-queries a stale zero-rect send button instead of clicking it", async () => {
+    vi.useFakeTimers();
+    try {
+      let lookups = 0;
+      let clicksCompleted = 0;
+      const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("button.scrollIntoView")) {
+          lookups += 1;
+          if (lookups === 2) return { result: { value: { status: "stale" } } };
+          return {
+            result: {
+              value: {
+                status: "point",
+                x: 10,
+                y: 20,
+                state: { composerCleared: false, stopVisible: false, turnsCount: 0 },
+              },
+            },
+          };
+        }
+        if (expression.includes("clickSeen")) {
+          return {
+            result: {
+              value: {
+                composerCleared: clicksCompleted > 0,
+                stopVisible: false,
+                turnsCount: 0,
+                clickSeen: false,
+              },
+            },
+          };
+        }
+        return { result: { value: 0 } };
+      });
+      const input = {
+        dispatchMouseEvent: vi.fn(async ({ type }: { type: string }) => {
+          if (type === "mouseReleased") clicksCompleted += 1;
+        }),
+      };
+
+      const result = promptComposer.attemptSendButton({ evaluate } as never, input as never);
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      await expect(result).resolves.toBe(true);
+      // A stale result discards the previous point; two fresh samples precede the click.
+      expect(lookups).toBe(4);
+      expect(input.dispatchMouseEvent).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("arms the trusted-click marker only for isTrusted events", async () => {
+    vi.useFakeTimers();
+    try {
+      const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("button.scrollIntoView")) {
+          return { result: { value: { status: "missing" } } };
+        }
+        return { result: { value: 0 } };
+      });
+
+      const result = promptComposer.attemptSendButton(
+        { evaluate } as never,
+        { dispatchMouseEvent: vi.fn() } as never,
+      );
+      await vi.advanceTimersByTimeAsync(100);
+      await expect(result).resolves.toBe(false);
+
+      const script = evaluate.mock.calls
+        .map((args) => String((args[0] as { expression: string }).expression))
+        .find((expression) => expression.includes("button.scrollIntoView"));
+      expect(script).toContain("window.__oracleSendClickSeen = false;");
+      expect(script).toContain("if (!event.isTrusted) return;");
+      // The listener must sit on the document, not on a button node React can swap.
+      expect(script).toContain("document.addEventListener('click'");
+      expect(script).not.toContain("dispatchClickSequence");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("keeps the trusted-click marker when React replaces the send button node", async () => {
+    vi.useFakeTimers();
+    try {
+      const dom = createSendButtonDom();
+      const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("button.scrollIntoView") || expression.includes("clickSeen")) {
+          return { result: { value: dom.run(expression) } };
+        }
+        return { result: { value: 0 } };
+      });
+      const input = {
+        dispatchMouseEvent: vi.fn(async ({ type }: { type: string }) => {
+          if (type !== "mouseReleased") return;
+          // ChatGPT re-renders the composer, then the trusted click lands on the
+          // fresh node -- the one the arming pass never saw.
+          dom.replaceButton();
+          dom.dispatchTrustedClick();
+        }),
+      };
+
+      const result = promptComposer.attemptSendButton({ evaluate } as never, input as never);
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      // No composer/stop/turn signal ever flips here: the document-level marker
+      // is the only evidence that the click landed, and it must survive the swap.
+      await expect(result).resolves.toBe(true);
+      expect(input.dispatchMouseEvent).toHaveBeenCalledTimes(3);
+      expect(dom.listenerCount()).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("does not retry when the trusted-click marker cannot be read", async () => {
+    vi.useFakeTimers();
+    try {
+      const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("button.scrollIntoView")) {
+          return {
+            result: {
+              value: {
+                status: "point",
+                x: 10,
+                y: 20,
+                state: { composerCleared: false, stopVisible: false, turnsCount: 0 },
+              },
+            },
+          };
+        }
+        // No marker in the reply (destroyed context, navigation): a miss is
+        // unproven, so re-clicking would risk sending the prompt twice.
+        if (expression.includes("clickSeen")) {
+          return {
+            result: { value: { composerCleared: false, stopVisible: false, turnsCount: 0 } },
+          };
+        }
+        return { result: { value: 0 } };
+      });
+      const input = { dispatchMouseEvent: vi.fn(async () => undefined) };
+      const logger = Object.assign(vi.fn(), { verbose: false });
+
+      const result = promptComposer.attemptSendButton(
+        { evaluate } as never,
+        input as never,
+        logger as never,
+      );
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      await expect(result).resolves.toBe(true);
+      expect(input.dispatchMouseEvent).toHaveBeenCalledTimes(3);
+      // A later commit timeout needs to say why verification passed.
+      expect(logger.mock.calls.map(([line]) => String(line)).join("\n")).toContain(
+        "could not read the trusted-click marker",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("logs a thrown verification probe instead of treating it as a miss", async () => {
+    vi.useFakeTimers();
+    try {
+      const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+        if (expression.includes("button.scrollIntoView")) {
+          return {
+            result: {
+              value: {
+                status: "point",
+                x: 10,
+                y: 20,
+                state: { composerCleared: false, stopVisible: false, turnsCount: 0 },
+              },
+            },
+          };
+        }
+        if (expression.includes("clickSeen")) {
+          throw new Error("Execution context was destroyed");
+        }
+        return { result: { value: 0 } };
+      });
+      const input = { dispatchMouseEvent: vi.fn(async () => undefined) };
+      const logger = Object.assign(vi.fn(), { verbose: false });
+
+      const result = promptComposer.attemptSendButton(
+        { evaluate } as never,
+        input as never,
+        logger as never,
+      );
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      await expect(result).resolves.toBe(true);
+      expect(input.dispatchMouseEvent).toHaveBeenCalledTimes(3);
+      const lines = logger.mock.calls.map(([line]) => String(line)).join("\n");
+      expect(lines).toContain("verification probe threw: Execution context was destroyed");
+      expect(lines).not.toContain("could not read the trusted-click marker");
     } finally {
       vi.useRealTimers();
     }
