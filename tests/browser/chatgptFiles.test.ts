@@ -103,6 +103,7 @@ describe("readAssistantDownloadableFiles", () => {
               url: "sandbox:/mnt/data/source.tar.gz",
               sandboxUrl: "sandbox:/mnt/data/source.tar.gz",
               filename: "source.tar.gz",
+              messageId: "msg-source",
             },
           ],
         },
@@ -121,7 +122,129 @@ describe("readAssistantDownloadableFiles", () => {
       url: "sandbox:/mnt/data/source.tar.gz",
       sandboxUrl: "sandbox:/mnt/data/source.tar.gz",
       filename: "source.tar.gz",
+      messageId: "msg-source",
     });
+  });
+
+  test("collector expression tags each file with the assistant message id of its turn", () => {
+    const anchor = anchorControl("report.csv", { href: "sandbox:/mnt/data/report.csv" });
+    const turn = new FakeElement(
+      "",
+      { "data-turn": "assistant", "data-message-id": "msg-owner" },
+      "",
+      [anchor],
+      "DIV",
+    );
+    const expression = __test__.buildAssistantDownloadableFilesExpression();
+
+    const files = Function(
+      "document",
+      "location",
+      "HTMLElement",
+      `return ${expression};`,
+    )({ querySelectorAll: () => [turn] }, { origin: "https://chatgpt.com" }, FakeElement);
+
+    expect(files).toEqual([
+      expect.objectContaining({
+        sandboxUrl: "sandbox:/mnt/data/report.csv",
+        messageId: "msg-owner",
+      }),
+    ]);
+  });
+});
+
+describe("buildSandboxDownloadResolveExpression", () => {
+  async function runResolve(
+    expression: string,
+    pathname: string,
+    turns: FakeElement[],
+    fetchMock: unknown,
+  ): Promise<unknown> {
+    return Function(
+      "location",
+      "document",
+      "fetch",
+      "HTMLElement",
+      `return ${expression};`,
+    )({ pathname }, { querySelectorAll: () => turns }, fetchMock, FakeElement);
+  }
+
+  function assistantMessage(messageId: string): FakeElement {
+    return new FakeElement(
+      "",
+      { "data-turn": "assistant", "data-message-id": messageId },
+      "",
+      [],
+      "DIV",
+    );
+  }
+
+  test("tries the owning message first, then every other assistant message in the run", async () => {
+    const signedUrl = "https://chatgpt.com/backend-api/estuary/content?id=file_x&sig=secret";
+    const fetchMock = vi.fn(async (url: string, _init?: RequestInit) => {
+      if (url === "/api/auth/session") {
+        return { ok: true, status: 200, json: async () => ({ accessToken: "access-secret" }) };
+      }
+      const resolves = url.includes("message_id=msg-2&");
+      return {
+        ok: resolves,
+        status: resolves ? 200 : 404,
+        json: async () => ({ download_url: signedUrl }),
+      };
+    });
+    const turns = [
+      assistantMessage("msg-0"),
+      new FakeElement("", { "data-turn": "user" }, "", [], "DIV"),
+      assistantMessage("msg-2"),
+      assistantMessage("msg-3"),
+      assistantMessage("msg-4"),
+      assistantMessage("msg-5"),
+    ];
+    const expression = __test__.buildSandboxDownloadResolveExpression({
+      sandboxPath: "/mnt/data/out.csv",
+      messageId: "msg-owner",
+      minTurnIndex: 2,
+    });
+
+    const result = await runResolve(expression, "/g/g-project/c/conv-123", turns, fetchMock);
+
+    expect(result).toEqual({ ok: true, downloadUrl: signedUrl, messageId: "msg-2" });
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/auth/session", { credentials: "include" });
+    const requested = fetchMock.mock.calls
+      .slice(1)
+      .map(([url]) => new URL(String(url), "https://chatgpt.com"));
+    expect(requested.map((url) => url.pathname)).toEqual(
+      Array(5).fill("/backend-api/conversation/conv-123/interpreter/download"),
+    );
+    expect(requested.map((url) => url.searchParams.get("message_id"))).toEqual([
+      "msg-owner",
+      "msg-5",
+      "msg-4",
+      "msg-3",
+      "msg-2",
+    ]);
+    expect(requested[0]?.searchParams.get("sandbox_path")).toBe("/mnt/data/out.csv");
+    expect(fetchMock.mock.calls[1]?.[1]).toEqual({
+      credentials: "include",
+      headers: { authorization: "Bearer access-secret" },
+    });
+  });
+
+  test("refuses transient WEB: conversation routes without calling the backend", async () => {
+    const fetchMock = vi.fn();
+    const expression = __test__.buildSandboxDownloadResolveExpression({
+      sandboxPath: "/mnt/data/out.csv",
+    });
+
+    const result = await runResolve(
+      expression,
+      "/c/WEB:request-1",
+      [assistantMessage("msg-1")],
+      fetchMock,
+    );
+
+    expect(result).toMatchObject({ ok: false, error: expect.stringContaining("durable") });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 
@@ -188,37 +311,45 @@ describe("saveChatGptDownloadableFiles", () => {
     await expect(fs.readFile(result.savedFiles[0]!.path)).resolves.toEqual(Buffer.from([9, 8, 7]));
   });
 
-  test("saves sandbox-only references through the ChatGPT sandbox download endpoint", async () => {
+  test("resolves sandbox-only references in-page before fetching the signed URL", async () => {
     const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-sandbox-file-"));
     setOracleHomeDirOverrideForTest(tmpHome);
+    const signedUrl =
+      "https://chatgpt.com/backend-api/estuary/content?id=file_source&fn=source.tar.gz&sig=secret";
+    const runtime = {
+      evaluate: vi
+        .fn()
+        .mockResolvedValueOnce({ result: { value: { ok: true, downloadUrl: signedUrl } } })
+        .mockResolvedValueOnce({
+          result: {
+            value: {
+              ok: true,
+              status: 200,
+              statusText: "OK",
+              url: signedUrl,
+              contentDisposition: 'attachment; filename="source.tar.gz"',
+              contentType: "application/gzip",
+              base64: Buffer.from([3, 2, 1]).toString("base64"),
+            },
+          },
+        }),
+    } as unknown as ChromeClient["Runtime"];
     const network = {
-      getCookies: vi.fn().mockResolvedValue({
-        cookies: [{ name: "__Secure-next-auth.session-token", value: "abc" }],
-      }),
+      getCookies: vi.fn().mockResolvedValue({ cookies: [] }),
     } as unknown as ChromeClient["Network"];
-    globalThis.fetch = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      statusText: "OK",
-      url: "https://chatgpt.com/backend-api/sandbox/download?path=%2Fmnt%2Fdata%2Fsource.tar.gz",
-      headers: {
-        get: (name: string) => {
-          if (name === "content-type") return "application/gzip";
-          if (name === "content-disposition") return 'attachment; filename="source.tar.gz"';
-          return null;
-        },
-      },
-      arrayBuffer: async () => Uint8Array.from([3, 2, 1]).buffer,
-    } as Response);
+    globalThis.fetch = vi.fn();
 
     const result = await saveChatGptDownloadableFiles({
       Network: network,
+      Runtime: runtime,
       sessionId: "file-session",
+      minTurnIndex: 4,
       files: [
         {
           url: "sandbox:/mnt/data/source.tar.gz",
           sandboxUrl: "sandbox:/mnt/data/source.tar.gz",
           filename: "source.tar.gz",
+          messageId: "msg-owner",
         },
       ],
     });
@@ -227,6 +358,8 @@ describe("saveChatGptDownloadableFiles", () => {
     expect(result.fileCount).toBe(1);
     expect(result.savedFiles[0]).toMatchObject({
       kind: "file",
+      url: signedUrl,
+      finalUrl: signedUrl,
       filename: "source.tar.gz",
       sourceUrl: "sandbox:/mnt/data/source.tar.gz",
       sandboxUrl: "sandbox:/mnt/data/source.tar.gz",
@@ -235,17 +368,39 @@ describe("saveChatGptDownloadableFiles", () => {
     expect(result.savedFiles[0]?.path).toBe(
       path.join(tmpHome, "sessions", "file-session", "artifacts", "source.tar.gz"),
     );
-    const [fetchUrl, fetchOptions] = vi.mocked(globalThis.fetch).mock.calls[0]!;
-    expect(String(fetchUrl)).toBe(
-      "https://chatgpt.com/backend-api/sandbox/download?path=%2Fmnt%2Fdata%2Fsource.tar.gz",
-    );
-    expect(fetchOptions).toEqual(
-      expect.objectContaining({
-        headers: expect.objectContaining({
-          cookie: "__Secure-next-auth.session-token=abc",
-        }),
+    const resolveExpression = vi.mocked(runtime.evaluate).mock.calls[0]?.[0]?.expression ?? "";
+    expect(resolveExpression).toContain('const SANDBOX_PATH = "/mnt/data/source.tar.gz"');
+    expect(resolveExpression).toContain('const OWNER_MESSAGE_ID = "msg-owner"');
+    expect(resolveExpression).toContain("const MIN_TURN_INDEX = 4");
+    expect(resolveExpression).toContain("/interpreter/download?message_id=");
+    const fetchExpression = vi.mocked(runtime.evaluate).mock.calls[1]?.[0]?.expression ?? "";
+    expect(fetchExpression).toContain(JSON.stringify(signedUrl));
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+
+  test("rejects a resolved download URL outside the ChatGPT file endpoints", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValueOnce({
+        result: { value: { ok: true, downloadUrl: "https://evil.example/file.zip?sig=secret" } },
       }),
-    );
+    } as unknown as ChromeClient["Runtime"];
+    const network = {
+      getCookies: vi.fn().mockResolvedValue({ cookies: [] }),
+    } as unknown as ChromeClient["Network"];
+    globalThis.fetch = vi.fn();
+
+    const result = await saveChatGptDownloadableFiles({
+      Network: network,
+      Runtime: runtime,
+      sessionId: "file-session",
+      files: [{ url: "sandbox:/mnt/data/file.zip", sandboxUrl: "sandbox:/mnt/data/file.zip" }],
+    });
+
+    expect(result.saved).toBe(false);
+    expect(result.errors[0]).toContain("unsupported download URL");
+    expect(result.errors[0]).not.toContain("sig=secret");
+    expect(runtime.evaluate).toHaveBeenCalledTimes(1);
+    expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 
   test("does not forward ChatGPT cookies across external redirects", async () => {
@@ -308,10 +463,12 @@ describe("saveChatGptDownloadableFiles", () => {
         cookies: [{ name: "__Secure-next-auth.session-token", value: "abc" }],
       }),
     } as unknown as ChromeClient["Network"];
+    const runtime = { evaluate: vi.fn() } as unknown as ChromeClient["Runtime"];
     globalThis.fetch = vi.fn();
 
     const result = await saveChatGptDownloadableFiles({
       Network: network,
+      Runtime: runtime,
       sessionId: "file-session",
       files: [
         {
@@ -325,6 +482,7 @@ describe("saveChatGptDownloadableFiles", () => {
     expect(result.saved).toBe(false);
     expect(result.fileCount).toBe(1);
     expect(result.errors[0]).toContain("no ChatGPT download URL found");
+    expect(runtime.evaluate).not.toHaveBeenCalled();
     expect(globalThis.fetch).not.toHaveBeenCalled();
   });
 });
@@ -428,9 +586,18 @@ describe("collectChatGptFileArtifacts", () => {
           result: {
             value: {
               ok: true,
+              downloadUrl:
+                "https://chatgpt.com/backend-api/estuary/content?id=file_smoke&fn=oracle_pr245_file_artifact_smoke.csv&sig=secret",
+            },
+          },
+        })
+        .mockResolvedValueOnce({
+          result: {
+            value: {
+              ok: true,
               status: 200,
               statusText: "OK",
-              url: "https://chatgpt.com/backend-api/sandbox/download?path=%2Fmnt%2Fdata%2Foracle_pr245_file_artifact_smoke.csv",
+              url: "https://chatgpt.com/backend-api/estuary/content?id=file_smoke&fn=oracle_pr245_file_artifact_smoke.csv&sig=secret",
               contentDisposition: null,
               contentType: "text/csv",
               base64: Buffer.from(csv).toString("base64"),
@@ -482,7 +649,7 @@ describe("collectChatGptFileArtifacts", () => {
     );
   });
 
-  test("reports sanitized direct sandbox fetch diagnostics when no browser-host file is saved", async () => {
+  test("reports sanitized sandbox resolve diagnostics when no browser-host file is saved", async () => {
     const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-file-diagnostics-"));
     setOracleHomeDirOverrideForTest(tmpHome);
     const logger = vi.fn();
@@ -494,14 +661,9 @@ describe("collectChatGptFileArtifacts", () => {
           result: {
             value: {
               ok: false,
-              status: 403,
-              statusText: "Forbidden",
-              url: "https://chatgpt.com/backend-api/sandbox/download?path=%2Fmnt%2Fdata%2Fresult.zip&token=secret-token",
-              contentDisposition: null,
-              contentType: "application/json",
-              base64: Buffer.from(
-                '{"error":"missing token abc123","signed_url":"https://example.com/private?sig=secret"}',
-              ).toString("base64"),
+              statuses: [403],
+              error:
+                "interpreter rejected token=abc123 at https://chatgpt.com/private?sig=secret-token",
             },
           },
         }),
@@ -521,11 +683,7 @@ describe("collectChatGptFileArtifacts", () => {
     expect(result.fileCount).toBe(1);
     expect(result.savedFiles).toHaveLength(0);
     expect(logger).toHaveBeenCalledWith(expect.stringContaining("status=403"));
-    expect(logger).toHaveBeenCalledWith(expect.stringContaining("contentType=application/json"));
-    expect(logger).toHaveBeenCalledWith(
-      expect.stringContaining("finalUrlKind=chatgpt-sandbox-download"),
-    );
-    expect(logger).toHaveBeenCalledWith(expect.stringContaining("bodyKind=json"));
+    expect(logger).toHaveBeenCalledWith(expect.stringContaining("sandbox download resolve failed"));
     expect(logger).toHaveBeenCalledWith(
       expect.stringContaining("bridge artifact-ready will not be emitted"),
     );
@@ -538,7 +696,7 @@ describe("collectChatGptFileArtifacts", () => {
     expect(logText).not.toContain("abc123");
   });
 
-  test("falls back to assistant download buttons when sandbox download URL is not fetchable", async () => {
+  test("falls back to assistant download buttons when sandbox URL resolution fails", async () => {
     const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-file-button-"));
     setOracleHomeDirOverrideForTest(tmpHome);
     const sessionId = "collect-session";
@@ -553,12 +711,8 @@ describe("collectChatGptFileArtifacts", () => {
           result: {
             value: {
               ok: false,
-              status: 404,
-              statusText: "Not Found",
-              url: "https://chatgpt.com/backend-api/sandbox/download?path=%2Fmnt%2Fdata%2Foracle_pr245_file_artifact_smoke_out.csv",
-              contentDisposition: null,
-              contentType: "application/json",
-              base64: Buffer.from('{"detail":"Not Found"}').toString("base64"),
+              statuses: [404],
+              error: "interpreter download resolve failed for 1 assistant message id(s)",
             },
           },
         })
@@ -956,7 +1110,7 @@ describe("collectChatGptFileArtifacts", () => {
       __test__.normalizeChatGptDownloadUrl(
         "https://chatgpt.com/backend-api/sandbox/download?path=%2Fmnt%2Fdata%2Ffile.zip",
       ),
-    ).toBe("https://chatgpt.com/backend-api/sandbox/download?path=%2Fmnt%2Fdata%2Ffile.zip");
+    ).toBeUndefined();
     expect(
       __test__.normalizeChatGptDownloadUrl(
         "https://chatgpt.com/backend-api/estuary/content?id=file_abc123",
@@ -977,9 +1131,6 @@ describe("collectChatGptFileArtifacts", () => {
       "sandbox:/mnt/data/file.zip",
     );
     expect(__test__.normalizeSandboxUrl("sandbox:/mnt/data/../secret.txt")).toBeUndefined();
-    expect(__test__.downloadUrlFromSandboxUrl("sandbox:/mnt/data/file.zip")).toBe(
-      "https://chatgpt.com/backend-api/sandbox/download?path=%2Fmnt%2Fdata%2Ffile.zip",
-    );
     expect(
       __test__.readTextDownloadableFiles(
         "[file](sandbox:/mnt/data/oracle_pr245_file_artifact_smoke.csv)",
@@ -1140,7 +1291,9 @@ describe("collectChatGptFileArtifacts", () => {
       { markClicked: true, maxClicks: 1 },
     );
 
-    expect(fileExpression).toContain("files.push(...serializeFiles(messageRoot))");
+    expect(fileExpression).toContain(
+      "files.push(...serializeFiles(messageRoot).map((file) => ({ ...file, messageId })))",
+    );
     expect(fileExpression).not.toContain("if (files.length > 0) return files");
     expect(expression).toContain("/^download\\b/");
     expect(expression).not.toContain("/^download\b/");
